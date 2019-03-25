@@ -5,21 +5,27 @@ MECH_VPP_DIR="$DEST/networking-vpp"
 MECH_VPP_BIN_DIR=$(get_python_exec_prefix)
 VPP_CP_BINARY="$MECH_VPP_BIN_DIR/vpp-agent"
 
-VPP_BRANCH=${VPP_BRANCH:-stable.1701}
+VPP_BRANCH=${VPP_BRANCH:-stable.1810}
 
 #VPP interface pci device. Only used if VPP is being installed when devstack is run.
-VPP_INT_PCI_DEV=${VPP_INT_PCI_DEV:-'0000:02:02.0'}
+VPP_INT_PCI_DEV=${VPP_INT_PCI_DEV:-''}
 
 #VPP startup config file path. If specified, it will overwrite /etc/vpp/startup.conf
 #VPP_INT_PCI_DEV will be ignored if VPP_STARTUP_CONFIG is set.
 VPP_STARTUP_CONFIG=${VPP_STARTUP_CONFIG:-}
+VPP_STARTUP_OVERRIDE_CONFIG=${VPP_STARTUP_OVERRIDE_CONFIG:-}
 
 #If specified, ensure system hugepage count is at least configured as specified.
 #If the system is already configured with more huge pages than NR_HUGEPAGES, no action will be taken.
 NR_HUGEPAGES=${NR_HUGEPAGES:-}
 
-MECH_VPP_PHYSNETLIST=${MECH_VPP_PHYSNETLIST:-physnet:GigabitEthernet2/2/0}
+MECH_VPP_PHYSNETLIST=${MECH_VPP_PHYSNETLIST:-physnet:tap-0}
 #Ip address of the host to connect to
+if is_service_enabled etcd3; then
+    # The standard service puts it here
+    ETCD_HOST=${ETCD_HOST:-${HOST_IP}}
+fi
+# By default, we put it here if we run it for ourselves
 ETCD_HOST=${ETCD_HOST:-127.0.0.1}
 #Etcd port to connect to
 ETCD_PORT=${ETCD_PORT:-2379}
@@ -43,3 +49,21 @@ GPE_LOCATORS=${GPE_LOCATORS:-}
 #VXLAN_SRC_ADDR=${VXLAN_SRC_ADDR:-}
 #VXLAN_BCAST_ADDR=${VXLAN_BCAST_ADDR:-}
 #VXLAN_VRF=${VXLAN_VRF:-1}
+
+# Run a local copy of etcd
+# This will be disabled if the devstack etcd3 service is running
+RUN_ETCD=yes
+# Remove any cruft we found in our area of etcd
+CLEAN_ETCD=yes
+
+# If a cert is provided, jwt is enabled
+JWT_CA_CERT=${JWT_CA_CERT:-}
+JWT_NODE_CERT=${JWT_NODE_CERT:-}
+JWT_NODE_PRIVATE_KEY=${JWT_NODE_PRIVATE_KEY:-}
+JWT_CONTROLLER_NAME_PATTERN=${JWT_CONTROLLER_NAME_PATTERN:-}
+JWT_MAX_DURATION=${JWT_MAX_DURATION:-0}
+
+# Layer3 Router/HA Settings
+# Provide a hostname or a comma separated list of L3 hostnames
+L3_HOSTS=${L3_HOSTS:-localhost}
+

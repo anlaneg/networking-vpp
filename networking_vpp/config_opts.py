@@ -14,9 +14,10 @@
 #    under the License.
 
 from networking_vpp._i18n import _
+from networking_vpp import etcdutils
 from oslo_config import cfg
 
-vpp_opts = [
+_vpp_opts = [
     cfg.StrOpt('physnets',
                help=_("Comma-separated list of net-name:interface-name for "
                       "physical connections")),
@@ -31,37 +32,81 @@ vpp_opts = [
                       "specified on compute and network nodes. In the "
                       "current implementation only a single locator "
                       "is supported.")),
-    cfg.StrOpt('etcd_host', default="127.0.0.1",
-               help=_("Etcd host IP address(es) to connect etcd client."
-                      "It takes two formats: single IP/host or a multiple "
-                      "hosts list with this format: 'IP:Port,IP:Port'. "
-                      "e.g: 192.168.1.1:2379,192.168.1.2:2379.  If port "
-                      "is absent, etcd_port is used.")),
-    cfg.IntOpt('etcd_port', default=4001,
-               help=_("Etcd port to connect the etcd client.  This can "
-                      "be overridden on a per-host basis if the multiple "
-                      "host form of etcd_host is used.")),
-    cfg.StrOpt('etcd_user', default=None,
-               help=_("Username for etcd authentication")),
-    cfg.StrOpt('etcd_pass', default=None,
-               help=_("Password for etcd authentication")),
-    # TODO(ijw): make false default
-    cfg.BoolOpt('etcd_insecure_explicit_disable_https', default=True,
-                help=_("Use TLS to access etcd")),
-    cfg.StrOpt('etcd_ca_cert', default=None,
-               help=_("etcd CA certificate file path")),
+    cfg.ListOpt('gpe_vni_ranges', default=[],
+                help=_("A comma-separated list of <tun_min>:<tun_max> "
+                       "tuples enumerating ranges of GPE VNI IDs "
+                       "available for tenant network allocation")),
+    cfg.IntOpt('etcd_write_time', default=20,
+               help=_("The period of time alloted to etcd write before it is "
+                      "timed out.")),
+    cfg.IntOpt('forward_worker_master_lease_time', default=30,
+               help=_("The slice of time allotted for a journal forward worker"
+                      " thread to run once elected.")),
+    cfg.IntOpt('forward_worker_recovery_time', default=3,
+               help=_("The worst case time a new forward worker master is "
+                      "elected after a forward worker's mastership expires. "
+                      "etcd updates may stall for a total of "
+                      "forward_worker_master_lease_time plus "
+                      "forward_worker_recovery_time.")),
+    cfg.IntOpt('db_query_time', default=60,
+               help=_("The period of a db query can run before it is timed "
+                      "out. This is to ensure master election time is extended"
+                      " accordingly")),
     cfg.BoolOpt('enable_vpp_restart', default=False,
                 help=_("Agent restarts VPP during startup")),
     cfg.StrOpt('vhost_user_dir', default='/tmp',
                help=_("vhostuser socket directory")),
     cfg.IntOpt('mac_age', default=180,
                help=_("bridge domain MAC aging TTL (in seconds)")),
-    cfg.IntOpt('tap_wait_time', default=60,
-               help=_("Maximum time to wait for a tap device.")),
     cfg.IntOpt('vpp_cmd_queue_len', default=None,
                help=_("Size of the VPP command queue (in messages)")),
-    cfg.StrOpt('l3_host', default="127.0.0.1",
-               help=_("Hostname to render L3 services on.")),
+    cfg.IntOpt('read_timeout', default=None,
+               help=_("(VPP 18.07+) How long we "
+                      "will wait for replies to VPP calls")),
+    cfg.StrOpt('l3_hosts', default="127.0.0.1",
+               help=_("A comma separated list of Hostnames "
+                      "to render L3 services on.")),
+    cfg.BoolOpt('enable_l3_ha', default=False,
+                help=_("Enable L3 HA feature. Disabled by default.")),
+    cfg.BoolOpt('jwt_signing', default=False,
+                help=_("Activate JWT token in etcd messages")),
+
+    cfg.StrOpt('jwt_ca_cert',
+               default=None,
+               help=_("Root CA certificate for the JWT verification")),
+    cfg.StrOpt('jwt_node_cert',
+               default=None,
+               help=_("Local Node certificate for the JWT verification")),
+    cfg.StrOpt('jwt_node_private_key',
+               default=None,
+               help=_("Local Node private key for the JWT computation")),
+
+    cfg.IntOpt('jwt_max_duration', default=0,
+               help=_("JWT token max duration in seconds to prevent"
+                      " replay attack")),
+
+    cfg.StrOpt('jwt_controller_name_pattern', default="Controller.*",
+               help=_("Openstack Controller Host name for JWT verification")),
+    cfg.StrOpt('vpp_base_mac', default="fa:16:3c:00:00:00",
+               help=_("The base MAC address used for VPP."
+                      "The last 3 octets will be randomly generated.")),
+    cfg.StrOpt('vpp_agent_extensions', default='',
+               help=_("Enabled extensions for the VPP agent")),
+    cfg.StrOpt('driver_extensions', default='',
+               help=_("Enabled extensions for the mechanism driver"))
 ]
 
-cfg.CONF.register_opts(vpp_opts, "ml2_vpp")
+cfg_group = cfg.OptGroup(name='ml2_vpp',
+                         title='VPP mechanism driver options',
+                         help='Configures the VPP ML2 driver and its agents.')
+
+
+def register_vpp_opts(cfg=cfg.CONF):
+    global _vpp_opts
+    cfg.register_opts(_vpp_opts, cfg_group)
+    etcdutils.register_etcd_conn_opts(cfg, cfg_group)
+
+
+def list_opts():
+    """Oslo config generator entry point"""
+    return [(cfg_group, _vpp_opts + etcdutils.list_opts())]

@@ -42,12 +42,18 @@ except ImportError:
     context = neutron.context
 
 try:
+   from neutron_lib.api.definitions import provider_net as n_provider
+except ImportError:
+   # Newton, at least, has this:
+   from neutron.extensions import providernet as n_provider
+
+try:
     # Mitaka+
     import neutron_lib.constants
     import neutron_lib.exceptions
 
     n_const = neutron_lib.constants
-    n_exec = neutron_lib.exceptions
+    n_exc = neutron_lib.exceptions
 
 except ImportError:
     import neutron.common.constants  # noqa: N530
@@ -56,6 +62,13 @@ except ImportError:
     n_const = neutron.common.constants
     n_exec = neutron.common.exceptions
 
+# Some of the TYPE_XXX objects also moved in Pike/Queens
+if hasattr(n_const, 'TYPE_FLAT'):
+    plugin_constants = n_const
+else:
+    import neutron.plugins.common.constants
+    plugin_constants = neutron.plugins.common.constants
+
 try:
     n_const.UUID_PATTERN
 except AttributeError:
@@ -63,6 +76,16 @@ except AttributeError:
     n_const.UUID_PATTERN = '-'.join([HEX_ELEM + '{8}', HEX_ELEM + '{4}',
                                      HEX_ELEM + '{4}', HEX_ELEM + '{4}',
                                      HEX_ELEM + '{12}'])
+
+try:
+    from neutron.callbacks import events
+    from neutron.callbacks import registry
+    from neutron.callbacks import resources
+except ImportError:
+    # Queens+
+    from neutron_lib.callbacks import events
+    from neutron_lib.callbacks import registry
+    from neutron_lib.callbacks import resources
 
 try:
     # Newton+
@@ -79,19 +102,60 @@ except ImportError:
     directory = neutron.manager.NeutronManager
     model_base = neutron.db.model_base
 
-# Register security group option
-# Mitaka compatibility
 try:
-    from neutron.conf.agent import securitygroups_rpc
-    securitygroups_rpc.register_securitygroups_opts()
-except ImportError:
-    from oslo_config import cfg
-    security_group_opts = [
-        cfg.BoolOpt(
-            'enable_security_group', default=True,
-            help=_('Controls whether neutron security groups is enabled '
-                   'Set it to false to disable security groups')), ]
-    cfg.CONF.register_opts(security_group_opts, 'SECURITYGROUP')
+    # Newton
+    n_const.L3
+except AttributeError:
+    try:
+        n_const.L3 = plugin_constants.L3_ROUTER_NAT
+    except AttributeError:
+        # Rocky
+        n_const.L3 = neutron_lib.plugins.constants.L3
+
+# Register security group option
+def register_securitygroups_opts(cfg):
+    # Mitaka compatibility
+    try:
+        from neutron.conf.agent import securitygroups_rpc
+        securitygroups_rpc.register_securitygroups_opts()
+    except ImportError:
+        security_group_opts = [
+            cfg.BoolOpt(
+                'enable_security_group', default=True,
+                help=_('Controls whether neutron security groups is enabled '
+                       'Set it to false to disable security groups')), ]
+        # This can get loaded from other parts of Mitaka because other
+        # mechanism drivers respect this flag too
+        if not (hasattr(cfg.CONF, 'SECURITYGROUP') and
+                hasattr(cfg.CONF.SECURITYGROUP.enable_security_group)):
+            cfg.register_opts(security_group_opts, 'SECURITYGROUP')
+
+def register_ml2_base_opts(cfg):
+    try:
+        # Older
+        from neutron.plugins.ml2 import config
+        # Calls register whether you like it or not, with no choice on arg
+    except ImportError:
+        # Newer (Pike-ish)
+        from neutron.conf.plugins.ml2 import config
+        config.register_ml2_plugin_opts(cfg)
+
+try:
+    # (for, specifically, get_random_mac)
+    # Newer:
+    from neutron_lib.utils import net as net_utils
+    if not hasattr(net_utils,'get_random_mac'):  # Check for Newton
+        raise AttributeError
+except (ImportError, AttributeError):
+    # Older:
+    from neutron.common import utils as net_utils
+assert hasattr(net_utils,'get_random_mac') == True
+
+try:
+    from neutron.plugins.ml2 import driver_api
+except:
+    # Between Pike and Queens
+    from neutron_lib.plugins.ml2 import api as driver_api
 
 import os
 import re

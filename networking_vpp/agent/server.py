@@ -22,6 +22,7 @@
 # that work was not repeated here where the aim was to get the APIs
 # worked out.  The two codebases will merge in the future.
 
+from __future__ import absolute_import
 # eventlet must be monkey patched early or we confuse urllib3.
 import eventlet
 
@@ -33,34 +34,51 @@ import binascii
 from collections import defaultdict
 from collections import namedtuple
 import etcd
-from ipaddress import ip_address
-from ipaddress import ip_network
+import eventlet.semaphore
+import ipaddress
 import os
 import re
+import shlex
+import six
 import sys
 import time
-import vpp
 
 from networking_vpp._i18n import _
+from networking_vpp.agent import gpe
+from networking_vpp.agent import vpp
 from networking_vpp import compat
 from networking_vpp.compat import n_const
+from networking_vpp.compat import net_utils
 from networking_vpp import config_opts
+from networking_vpp import constants as nvpp_const
 from networking_vpp import etcdutils
+from networking_vpp.ext_manager import ExtensionManager
+from networking_vpp.extension import VPPAgentExtensionBase
 from networking_vpp.mech_vpp import SecurityGroup
 from networking_vpp.mech_vpp import SecurityGroupRule
+from networking_vpp.utils import device_monitor
+from networking_vpp.utils import file_monitor
 from networking_vpp import version
 
 from neutron.agent.linux import bridge_lib
 from neutron.agent.linux import ip_lib
 from neutron.agent.linux import utils
-from neutron.plugins.common import constants as p_const
-from neutron.plugins.ml2 import config
+try:
+    # TODO(ijw): TEMPORARY, better fix coming that reverses this
+    from neutron.plugins.ml2 import config
+    assert config
+except ImportError:
+    from neutron.conf.plugins.ml2 import config
+    config.register_ml2_plugin_opts()
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_privsep import priv_context
 from oslo_reports import guru_meditation_report as gmr
 from oslo_reports import opts as gmr_opts
 from oslo_serialization import jsonutils
 
+
+TYPE_GPE = nvpp_const.TYPE_GPE
 
 LOG = logging.getLogger(__name__)
 
@@ -73,13 +91,53 @@ VppAcl = namedtuple('VppAcl', ['in_idx', 'out_idx'])
 # VPP does not maintain any session states
 reflexive_acls = True
 
-# config_opts and config are required to configure the options within it, but
-# not referenced from here, so shut up tox:
-assert config_opts
-assert config
-
 # Apply monkey patch if necessary
 compat.monkey_patch()
+
+# We use eventlet for everything but threads. Here, we need an eventlet-based
+# locking mechanism, so we call out eventlet specifically rather than using
+# threading.Semaphore.
+#
+# Our own, strictly eventlet, locking:
+_semaphores = defaultdict(eventlet.semaphore.Semaphore)
+
+
+def get_root_helper(conf):
+    """Root helper configured for privilege separation"""
+    return conf.AGENT.root_helper
+
+
+def setup_privsep():
+    """Use root helper (if present) to execute privileged commands"""
+    priv_context.init(root_helper=shlex.split(get_root_helper(cfg.CONF)))
+
+
+def eventlet_lock(name):
+    sema = _semaphores[name]
+
+    def eventlet_lock_decorator(func):
+        def func_wrap(*args, **kwargs):
+            LOG.debug("Acquiring lock '%s' before executing %s" %
+                      (name, func.__name__))
+            with sema:
+                LOG.debug("Acquired lock '%s' before executing %s" %
+                          (name, func.__name__))
+                return func(*args, **kwargs)
+        return func_wrap
+    return eventlet_lock_decorator
+
+
+# TODO(onong): move to common file in phase 2
+def ipnet(ip):
+    return ipaddress.ip_network(six.text_type(ip))
+
+
+def ipaddr(ip):
+    return ipaddress.ip_address(six.text_type(ip))
+
+
+def ipint(ip):
+    return ipaddress.ip_interface(six.text_type(ip))
 
 ######################################################################
 
@@ -246,15 +304,9 @@ def decode_secgroup_tag(tag):
 
     return None, None
 
-######################################################################
-# GPE constants
-# A name for a GPE locator-set, which is a set of underlay interface indexes
-gpe_lset_name = 'net-vpp-gpe-lset-1'
-
-#######################################################################
-
 
 class UnsupportedInterfaceException(Exception):
+    """Used when ML2 has tried to ask for a weird binding type."""
     pass
 
 
@@ -269,11 +321,9 @@ class VPPForwarder(object):
     def __init__(self,
                  physnets,  # physnet_name: interface-name
                  mac_age,
-                 tap_wait_time,
                  vpp_cmd_queue_len=None,
-                 gpe_src_cidr=None,
-                 gpe_locators=None):
-        self.vpp = vpp.VPPInterface(LOG, vpp_cmd_queue_len)
+                 read_timeout=None):
+        self.vpp = vpp.VPPInterface(LOG, vpp_cmd_queue_len, read_timeout)
 
         self.physnets = physnets
 
@@ -282,38 +332,68 @@ class VPPForwarder(object):
         # a Mapping of security groups to VPP ACLs
         self.secgroups = {}  # secgroup_uuid: VppAcl(ingress_idx, egress_idx)
 
+        # Security group UUID to the set of associated port UUIDs
+        self.remote_group_ports = defaultdict(set)
+        # Port UUID to its set of IP addresses
+        self.port_ips = defaultdict(set)
+        # Remote-group UUID to the set to security-groups that uses it
+        self.remote_group_secgroups = defaultdict(set)
+
         # ACLs we ought to delete
         self.deferred_delete_secgroups = set()
 
-        # This is the address we'll use if we plan on broadcasting
-        # vxlan packets
-        # GPE underlay IP address/mask
-        self.gpe_src_cidr = gpe_src_cidr
-        # Name of the GPE physnet uplink and its address
-        self.gpe_locators = gpe_locators
-        self.gpe_underlay_addr = None
+        # Enable the GPE forwarder programming, if required
+        if TYPE_GPE in cfg.CONF.ml2.type_drivers:
+            self.gpe = gpe.GPEForwarder(self)
+        else:
+            self.gpe = None
 
         self.networks = {}      # (physnet, type, ID): datastruct
         self.interfaces = {}    # uuid: if idx
+        self.router_interfaces = {}  # router_port_uuid: {}
+        self.router_external_interfaces = {}  # router external interfaces
+        self.floating_ips = {}  # floating_ip_uuid: {}
+        if cfg.CONF.ml2_vpp.enable_l3_ha:
+            # Router BVI (loopback) interface states for L3-HA
+            self.router_interface_states = {}  # {idx: state} 1 = UP, 0 = DOWN
+            # VPP Router state variable is updated by the RouterWatcher
+            # The default router state is the BACKUP.
+            # If this node should be the master it will be told soon enough,
+            # and this will prevent us from having two masters on any restart.
+            self.router_state = False  # True = Master; False = Backup
         # mac_ip acls do not support atomic replacement.
         # Here we create a mapping of sw_if_index to VPP ACL indices
         # so we can easily lookup the ACLs associated with the interface idx
         # sw_if_index: {"l34": [l34_acl_indxs], "l23": l23_acl_index }
         self.port_vpp_acls = defaultdict(dict)
-        # keeps track of gpe locators and mapping info
-        self.gpe_map = {'remote_map': {}}
-        # key: sw if index in VPP; present when vhost-user is
+
+        # key: OpenStack port UUID; present when vhost-user is
         # connected and removed when we delete things.  May accumulate
         # any other VPP interfaces too, but that's harmless.
-        self.iface_connected = set()
-
+        self.port_connected = set()
         self.vhost_ready_callback = None
-        cb_event = self.vpp.CallbackEvents.VHOST_USER_CONNECT
-        self.vpp.register_for_events(cb_event, self._vhost_ready_event)
+        eventlet.spawn_n(self.vhost_notify_thread)
 
-        self.tap_wait_time = tap_wait_time
-        self._external_taps = eventlet.Queue()
-        eventlet.spawn(self._add_external_tap_worker)
+        # Device monitor to ensure the tap interfaces are plugged into the
+        # right Linux brdige
+        self.device_monitor = device_monitor.DeviceMonitor()
+        self.device_monitor.on_add(self._consider_external_device)
+        # The worker will be in endless loop, so don't care the return value
+        eventlet.spawn_n(self.device_monitor.run)
+
+        # Start Vhostsocket filemonitor to bind sockets as soon as they appear.
+        self.filemonitor = file_monitor.FileMonitor(
+            watch_pattern=n_const.UUID_PATTERN,
+            watch_dir=cfg.CONF.ml2_vpp.vhost_user_dir)
+        # Register to handle ON_CREATE event.
+        self.filemonitor.register_on_add_cb(
+            self.ensure_interface_for_vhost_socket_binding)
+        # Register to handle ON_DELETE event.
+        # We are expecting the port unbinding call flow to clean up vhost
+        # sockets, hence ignoring delete events on vhost file handle.
+        self.filemonitor.register_on_del_cb(lambda *args: None)
+        # Finally start the file monitor.
+        eventlet.spawn_n(self.filemonitor.run)
 
     ########################################
     # Port resyncing on restart
@@ -384,18 +464,12 @@ class VPPForwarder(object):
                         '%(idx)d (%(physnet_name)s)',
                         {'idx': configured_physnet_interfaces[uplink_physnet],
                          'physnet_name': physnets[uplink_physnet]})
+                # This will remove ports from bridges, which means
+                # that they may be rebound back into networks later
+                # or may be deleted if no longer used.
                 self.delete_network_bridge_on_host(net_type,
                                                    sw_if_idx,
                                                    sw_if_idx)
-            if net_type == 'vlan':
-                # We only support VLAN networks here.  GPE networks
-                # can't be reconfigured like this right now. TODO(ijw)
-                self.delete_network_bridge_on_host(net_type,
-                                                   sw_if_idx,
-                                                   sw_if_idx)
-            # This will remove ports from bridges, which means
-            # that they may be rebound back into networks later
-            # or may be deleted if no longer used.
 
         for name, if_idx in physnet_ports_found.items():
             if configured_physnet_interfaces.get(name, None) != if_idx:
@@ -439,39 +513,60 @@ class VPPForwarder(object):
 
     ########################################
 
-    def _vhost_ready_event(self, iface):
-        """Callback from VPP interface on vhostuser socket connection"""
+    def vhost_notify_thread(self):
+        """Find vhostuser connections with an attached VM
 
-        # TODO(ijw): messy and a bit specific to the VPP interface -
-        # shouldn't be returning the API datastructure?
-        LOG.debug("vhost online: %s", str(iface))
-        self._notify_connected(iface.sw_if_index)
+        The moment of VM attachment is useful, as it's one of the
+        preconditions for notifying Nova a socket is ready.  Watching
+        the vhostuser data inside VPP has a performance impact on
+        forwarding, so instead we watch the kernel's idea of which
+        vhostuser connections are properly opened.
 
-    def _notify_connected(self, sw_if_index):
-        """Deal with newly active interfaces noticed by VPP
-
-        Any interface that has been created and has also been
-        connected to goes into the up state.  At this point, we can
-        safely say that the VM is ready for traffic passing.
-
-        When interacting with Nova, this usually indicates that the VM
-        has been created and the vhost-user connection made.  We
-        should send the notification only after the port has been
-        created and the hypervisor has attached to it.  (You have to
-        create the interface to be attached to but this checks for
-        the data that's written on creation to be ready to avoid
-        a race condition.)
-
-        We may send multiple notifications to Nova if an interface
-        disconnects and reconnects - this is harmless.
+        Having two open sockets is 99% ready - technically, the interface
+        is ready when VPP has mapped its memory, but these two events are
+        nearly contemporaenous, so this is good enough.
         """
-        self.iface_connected.add(sw_if_index)
+        dirname = cfg.CONF.ml2_vpp.vhost_user_dir
+        # We need dirname to have precisely one trailing slash.
+        dirname = dirname.rstrip('/') + '/'
 
-        if self.vhost_ready_callback:
-            self.vhost_ready_callback(sw_if_index)
+        while True:
+            opens = defaultdict(int)
 
-    def vhostuser_linked_up(self, sw_if_index):
-        return sw_if_index in self.iface_connected
+            with open('/proc/net/unix') as file:
+                # Track unix sockets in vhost directory that are opened more
+                # than once
+                for f in file:
+                    # Problems with files with spaces in, though
+                    _, file = f.rsplit(' ', 1)
+                    if file.startswith(dirname):
+                        file = file[len(dirname):].rstrip("\n")
+                        opens[file] = opens[file] + 1
+
+            # Report on any sockets that are open exactly twice (VPP + KVM)
+            # (note list clone so that we can delete entries)
+            for f in list(opens.keys()):
+                if opens[f] != 2:
+                    del opens[f]
+
+            opens = set(opens.keys())
+            open_notifications = opens - self.port_connected
+            # .. we don't have to notify the port drops, that's fine
+
+            # Update this *before* making callbacks so that this register is up
+            # to date
+            self.port_connected = opens
+            if self.vhost_ready_callback:
+                for uuid in open_notifications:
+                    self.vhost_ready_callback(uuid)
+
+            eventlet.sleep(1)
+
+    def vhostuser_linked_up(self, uuid):
+        return uuid in self.port_connected
+
+    def vhostuser_unlink(self, uuid):
+        self.port_connected.discard(uuid)
 
     ########################################
 
@@ -482,7 +577,7 @@ class VPPForwarder(object):
     ########################################
 
     def get_if_for_physnet(self, physnet):
-        """"Find (and mark used) the interface for a physnet"""
+        """Find (and mark used) the interface for a physnet"""
         ifname = self.physnets.get(physnet, None)
         if ifname is None:
             LOG.error('Physnet %s requested but not in config',
@@ -490,7 +585,7 @@ class VPPForwarder(object):
             return None, None
         ifidx = self.vpp.get_ifidx_by_name(ifname)
         if ifidx is None:
-            LOG.error('Physnet {1} interface {2} does not '
+            LOG.error('Physnet %s interface %s does not '
                       'exist in VPP', physnet, ifname)
             return None, None
         self.vpp.set_interface_tag(ifidx, physnet_if_tag(physnet))
@@ -561,14 +656,14 @@ class VPPForwarder(object):
 
             self.vpp.ifup(if_uplink)
 
-        elif net_type == 'vxlan':
-            # VXLAN bridges have no uplink interface at all.
+        elif net_type == TYPE_GPE and self.gpe is not None:
+            # GPE bridges have no uplink interface at all.
             # We link the bridge directly to the GPE code.
 
-            self.ensure_gpe_link()
-            bridge_idx = self.bridge_idx_for_lisp_segment(seg_id)
+            self.gpe.ensure_gpe_link()
+            bridge_idx = self.gpe.bridge_idx_for_segment(seg_id)
             self.ensure_bridge_domain_in_vpp(bridge_idx)
-            self.ensure_gpe_vni_to_bridge_mapping(seg_id, bridge_idx)
+            self.gpe.ensure_gpe_vni_to_bridge_mapping(seg_id, bridge_idx)
 
             # We attach the bridge to GPE without use of an uplink interface
             # as we affect forwarding in the bridge.
@@ -597,20 +692,20 @@ class VPPForwarder(object):
             bridge_domain_id = net['bridge_domain_id']
             uplink_if_idx = net.get('if_uplink_idx', None)
 
-            if net['network_type'] == 'vxlan':
+            if net['network_type'] == TYPE_GPE and self.gpe is not None:
                 # TODO(ijw): this needs reconsidering for resync
                 # network cleanup cases - it won't be called if it
                 # lives here - but for now, these rely on local
                 # caches of GPE data we programmed.
 
                 LOG.debug("Deleting vni %s from GPE map", seg_id)
-                self.gpe_map[gpe_lset_name]['vnis'].remove(seg_id)
+                self.gpe.delete_vni_from_gpe_map(seg_id)
                 # Delete all remote mappings corresponding to this VNI
-                self.clear_remote_gpe_mappings(seg_id)
+                self.gpe.clear_remote_gpe_mappings(seg_id)
                 # Delete VNI to bridge domain mapping
-                self.delete_gpe_vni_to_bridge_mapping(seg_id,
-                                                      bridge_domain_id
-                                                      )
+                self.gpe.delete_gpe_vni_to_bridge_mapping(seg_id,
+                                                          bridge_domain_id
+                                                          )
 
             self.delete_network_bridge_on_host(net_type, bridge_domain_id,
                                                uplink_if_idx)
@@ -634,6 +729,13 @@ class VPPForwarder(object):
             # be rebound to another bridge domain
             if_idxes = self.vpp.get_ifaces_in_bridge_domain(bridge_domain_id)
 
+            # When this bridge domain is for an OpenStack flat network, the
+            # uplink interface may be a physical interface, i.e. not VLAN-based
+            # sub-interfaces. In this case, we will not bring down the uplink
+            # interface, and always leave it UP.
+            if_idxes_without_uplink = \
+                [i for i in if_idxes if i != uplink_if_idx]
+
             # At startup, this is downing the interfaces in a bridge that
             # is no longer required.  However, in free running, this
             # should never find interfaces at all - they should all have
@@ -641,9 +743,12 @@ class VPPForwarder(object):
             # the removal of interfaces is probably the best thing we can
             # do, but they may not stay down if it races with the binding
             # code.)
-            self.vpp.ifdown(*if_idxes)
+            self.vpp.ifdown(*if_idxes_without_uplink)
             self.vpp.delete_from_bridge(*if_idxes)
             self.vpp.delete_bridge_domain(bridge_domain_id)
+
+        # The physnet is gone so no point in keeping the vlan sub-interface
+        # TODO(onong): VxLAN
         if net_type == 'vlan':
             if uplink_if_idx is not None:
                 self.vpp.delete_vlan_subif(uplink_if_idx)
@@ -685,63 +790,56 @@ class VPPForwarder(object):
 
     # end theft
     ########################################
-    def _add_external_tap_worker(self):
-        """Add an externally created TAP device to the bridge
+    def _consider_external_device(self, dev_name):
+        """See if we need to take action when a net device is created
 
-        Wait for the external tap device to be created by the DHCP agent.
-        When the tap device is ready, add it to bridge Run as a thread
-        so REST call can return before this code completes its
-        execution.
+        This function will be called as a callback when a new interface is
+        created in Linux kernel. We will filter for tap interfaces created by
+        OpenStack, and those will be added to the bridges that we create on the
+        Neutron side of things.
+        """
+        match = re.search(r'tap[0-9a-f]{8}-[0-9a-f]{2}', dev_name)
+        if not match:
+            return
+
+        # TODO(ijw) will act upon other mechanism drivers' taps
+
+        port_id = dev_name[3:]
+        bridge_name = "br-%s" % port_id
+        self.ensure_tap_in_bridge(dev_name, bridge_name)
+
+    def ensure_tap_in_bridge(self, tap_name, bridge_name):
+        """Add a TAP device to a bridge
+
+        Defend against this having been done already (common on restart)
+        and this missing a requirement (common when plugging external
+        tap interfaces).
         """
 
-        def _is_tap_configured(device_name, bridge, bridge_name):
+        bridge = bridge_lib.BridgeDevice(bridge_name)
+        bridge.set_log_fail_as_error(False)
+        if bridge.exists() and ip_lib.device_exists(tap_name) \
+           and not bridge.owns_interface(tap_name):
             try:
-                if ip_lib.device_exists(device_name):
-                    LOG.debug('Bridging tap interface %s on %s',
-                              device_name, bridge_name)
-                    if not bridge.owns_interface(device_name):
-                        bridge.addif(device_name)
-                    else:
-                        LOG.debug('Interface: %s is already added '
-                                  'to the bridge %s',
-                                  device_name, bridge_name)
-                    return True
-            except Exception as e:
-                LOG.exception(e)
-                # Something has gone bad, but we should not quit.
-                pass
-            return False
+                bridge.addif(tap_name)
+            except Exception as ex:
+                # External TAP interfaces created by DHCP or L3 agent will be
+                # added to corresponding Linux Bridge by vpp-agent to talk to
+                # VPP. During a regular port binding process, there are two
+                # code paths calling this function for adding the interface to
+                # the Linux Bridge, which may potentially cause a race
+                # condition and a non-harmful traceback in the log.
 
-        pending_taps = []
-        while True:
-            # While we were working, check if new taps have been requested
-            if not self._external_taps.empty():
-                pending_taps.append(self._external_taps.get())
-            elif len(pending_taps) == 0:
-                # We have no work to do and blocking is now OK,
-                # so wait on the empty external TAPs
-                pending_taps.append(self._external_taps.get())
+                # The fix will eliminate the non-harmful traceback in the log.
+                match = re.search(r"Stderr\: device (vpp|tap)[0-9a-f]{8}-"
+                                  "[0-9a-f]{2} is already a member of a "
+                                  "bridge; can't enslave it to bridge br-"
+                                  "[0-9a-f]{8}-[0-9a-f]{2}\.", ex.message)
+                if not match:
+                    LOG.exception("Can't add interface %s to bridge %s: %s" %
+                                  (tap_name, bridge_name, ex.message))
 
-            for tap in pending_taps:
-                (tap_timeout, dev_name, bridge, br_name) = tap
-                if _is_tap_configured(dev_name, bridge, br_name):
-                    pending_taps.remove(tap)
-                elif time.time() > tap_timeout:
-                    LOG.warning("Timeout for tap %s", dev_name)
-                    pending_taps.remove(tap)
-
-            # If we have more work, go for it straight away, otherwise
-            # take a breather because the old tap state will take
-            # time to change.
-            if len(pending_taps) != 0:
-                eventlet.sleep(2)
-
-    def add_external_tap(self, device_name, bridge, bridge_name):
-        """Enqueue tap info for the tap worker."""
-        self._external_taps.put((time.time() + self.tap_wait_time,
-                                 device_name, bridge, bridge_name))
-
-    def _ensure_kernelside_plugtap(self, bridge_name, tap_name, int_tap_name):
+    def _ensure_kernelside_tap(self, bridge_name, tap_name, int_tap_name):
         # This is the kernel-side config (and we should not assume
         # that, just because the interface exists in VPP, it has
         # been done previously - the crash could occur in the
@@ -751,19 +849,35 @@ class VPPForwarder(object):
 
         # TODO(ijw): someone somewhere ought to be sorting
         # the MTUs out
-        br = self.ensure_kernel_bridge(bridge_name)
-
-        # TODO(ijw) idempotency
-        # This is the external TAP device that will be
-        # created by Nova or an agent, say the DHCP agent
-        # later in time.
-        self.add_external_tap(tap_name, br, bridge_name)
+        self.ensure_kernel_bridge(bridge_name)
 
         # This is the device that we just created with VPP
-        if not br.owns_interface(int_tap_name):
-            br.addif(int_tap_name)
+        self.ensure_tap_in_bridge(int_tap_name, bridge_name)
 
-    def ensure_interface_on_host(self, if_type, uuid, mac):
+        # This is the external TAP device that will be
+        # created by Nova or an agent, say the DHCP agent,
+        # later in time.
+        self.ensure_tap_in_bridge(tap_name, bridge_name)
+
+    # This is called by the (eventlet) inotify functions and the (eventlet)
+    # etcd functionality, and thus needs an eventlet-based lock. We've found
+    # oslo_concurrency thinks that, because threading is unpatched, a threading
+    # lock is required, but this ends badly.
+    @eventlet_lock('ensure-interface-lock')
+    def ensure_interface_on_host(self, if_type, uuid, mac=None):
+        """Create or update vpp interface on host based on if_type.
+
+        Depending on the if_type (maketap, plugtap or vhostuser) call vpp papi
+        to do vpp side of the plumbing. This will change depending on the
+        if_type. The interfaces are tagged saved in the internal dict for easy
+        retrieval.
+
+        The call is idempotent if the uuid and its associated
+        interface is already present.
+
+        :return: dict indexed on uuid
+        """
+
         if uuid in self.interfaces:
             # It's definitely there, we made it ourselves
             pass
@@ -772,8 +886,18 @@ class VPPForwarder(object):
             # - and what exists may be wrong so we may have to
             # recreate it
             # TODO(ijw): idempotency
-            LOG.debug('creating port %s as type %s',
-                      uuid, if_type)
+
+            # Unfortunately call_vpp() expects a mac and we need to pass one.
+            # We will create a random mac if none is passed. We are setting
+            # base_mac from neutron, assuming neutron is the sole consumer of
+            # code at the moment. This is an assumption which might need a todo
+
+            if mac is None:
+                mac = net_utils.get_random_mac(
+                    cfg.CONF.ml2_vpp.vpp_base_mac.split(':'))
+
+            LOG.debug('Creating port %s as type %s with mac %s',
+                      uuid, if_type, mac)
 
             # Deal with the naming conventions of interfaces
 
@@ -781,9 +905,7 @@ class VPPForwarder(object):
             # Neutron's naming
             tap_name = get_tap_name(uuid)
 
-            if if_type == 'maketap':
-                props = {'name': tap_name}
-            elif if_type == 'plugtap':
+            if if_type == 'tap':
                 bridge_name = get_bridge_name(uuid)
                 int_tap_name = get_vpptap_name(uuid)
 
@@ -794,8 +916,7 @@ class VPPForwarder(object):
                 path = get_vhostuser_name(uuid)
                 props = {'path': path}
             else:
-                raise UnsupportedInterfaceException(
-                    _('unsupported interface type'))
+                raise UnsupportedInterfaceException()
 
             tag = port_tag(uuid)
 
@@ -816,23 +937,38 @@ class VPPForwarder(object):
                 LOG.debug('binding port %s as type %s' %
                           (uuid, if_type))
 
-                if if_type == 'maketap':
-                    iface_idx = self.vpp.create_tap(tap_name, mac, tag)
-                elif if_type == 'plugtap':
+                if if_type == 'tap':
                     iface_idx = self.vpp.create_tap(int_tap_name, mac, tag)
                 elif if_type == 'vhostuser':
                     iface_idx = self.vpp.create_vhostuser(path, mac, tag)
 
-            if if_type == 'plugtap':
+            if if_type == 'tap':
                 # Plugtap interfaces belong in a kernel bridge, and we need
                 # to monitor for the other side attaching.
-                self._ensure_kernelside_plugtap(bridge_name,
-                                                tap_name,
-                                                int_tap_name)
+                self._ensure_kernelside_tap(bridge_name,
+                                            tap_name,
+                                            int_tap_name)
 
             props['iface_idx'] = iface_idx
             self.interfaces[uuid] = props
         return self.interfaces[uuid]
+
+    def ensure_interface_for_vhost_socket_binding(self, name):
+        """Ensure vpp interface for imminent vhost socket binding.
+
+        Somebody has dropped a file in the vhost_socket_directory which matched
+        our watch pattern (Neutron port uuid). We are expecting an imminent
+        vhost socket binding (from presumably Nova), so lets get ahead of the
+        curve and create a vhost socket for it.
+
+        Inteface name is the vhost socket file name and since we don't know
+        the mac, let vhost interface create function make one.
+
+        """
+
+        LOG.debug("Calling VPP interface creation on vhost socket with props "
+                  "vif_type: %s , uuid: %s ", 'vhostuser', name)
+        self.ensure_interface_on_host('vhostuser', uuid=name, mac=None)
 
     def ensure_interface_in_vpp_bridge(self, net_br_idx, iface_idx):
         """Idempotently ensure that a bridge contains an interface
@@ -883,13 +1019,20 @@ class VPPForwarder(object):
             # For resyncs, the port exists but it's not in a bridge domain
             # and is down, which is the best we can offer.
             return None
+        if net_type == TYPE_GPE and self.gpe is None:
+            LOG.error('port bind - GPE is not enabled')
+            return None
+
         net_br_idx = net_data['bridge_domain_id']
         props = self.ensure_interface_on_host(if_type, uuid, mac)
         iface_idx = props['iface_idx']
         self.ensure_interface_in_vpp_bridge(net_br_idx, iface_idx)
         # Ensure local mac to VNI mapping for GPE
-        if net_type == 'vxlan':
-            self.add_local_gpe_mapping(seg_id, mac)
+        if net_type == TYPE_GPE:
+            mac = props['mac']
+            LOG.debug('Adding local GPE mapping for seg_id:%s and mac:%s',
+                      seg_id, mac)
+            self.gpe.add_local_gpe_mapping(seg_id, mac)
 
         props['net_data'] = net_data
         LOG.debug('Bound vpp interface with sw_idx:%s on '
@@ -911,20 +1054,110 @@ class VPPForwarder(object):
                       uuid)
         else:
             props = self.interfaces[uuid]
+            net = props.get('net_data')
             self.clean_interface_from_vpp(uuid, props)
+            # Delete the port ip address from remote_group_id list
+            self.port_ips.pop(uuid, None)
 
-            # Check if this is the last interface on host
-            for interface in self.interfaces.values():
-                if props['net_data'] == interface['net_data']:
-                    break
-            else:
-                # Network is not used on this host, delete it
-                net = props['net_data']
-                self.delete_network_on_host(net['physnet'],
-                                            net['network_type'],
-                                            net['segmentation_id'])
+            if net is not None:
+                # Check if this is the last interface on host, safe if this
+                # interface is incompletely bound
+                for interface in self.interfaces.values():
+                    if net == interface.get('net_data'):
+                        # safe if the other interface is not bound
+                        break
+                else:
+                    # Network is not used on this host, delete it
+                    self.delete_network_on_host(net['physnet'],
+                                                net['network_type'],
+                                                net['segmentation_id'])
+
+    def bind_subport_on_host(self, parent_port, subport_data):
+        """Bind the subport of a bound parent vhostuser port."""
+        # We ensure parent port binding before calling this method.
+        subport_uuid = subport_data['port_id']
+        subport_seg_id = subport_data['segmentation_id']
+
+        # parent vhostuser intf
+        parent_props = self.interfaces[parent_port]
+        parent_if_idx = parent_props['iface_idx']
+        # Ensure that the uplink and the BD's are setup
+        physnet = subport_data['physnet']
+        uplink_seg_type = subport_data['uplink_seg_type']
+        uplink_seg_id = subport_data['uplink_seg_id']
+        LOG.debug('trunk: ensuring subport network on host '
+                  'physnet %s, uplink_seg_type %s, uplink_seg_id %s',
+                  physnet, uplink_seg_type, uplink_seg_id)
+        # Ensure an uplink for the subport
+        # Use the uplink physnet, uplink_seg_id & seg_type
+        net_data = self.ensure_network_on_host(physnet,
+                                               uplink_seg_type,
+                                               uplink_seg_id)
+        if net_data is None:
+            LOG.error('trunk sub-port binding is not possible as the '
+                      'physnet could not be configured for subport')
+            return None
+
+        # fetch if the subport interface already in vpp
+        subport_tag = port_tag(subport_uuid)
+        subport_if_idx = self.vpp.get_ifidx_by_tag(subport_tag)
+        net_br_idx = net_data['bridge_domain_id']
+        if subport_if_idx is not None:
+            # It's already there and we created it
+            LOG.debug('Recovering existing trunk subport %s in VPP',
+                      subport_uuid)
+            # Ensure that the recovered subport is in vpp bridge
+            self.ensure_interface_in_vpp_bridge(net_br_idx, subport_if_idx)
+        else:
+            # create subport vhostuser intf and ensure it's in vpp bridge
+            LOG.debug('trunk: ensuring subport interface on host '
+                      'parent_if_idx %s, seg_id %s', parent_if_idx,
+                      subport_seg_id)
+            subport_if_idx = self.vpp.create_vlan_subif(parent_if_idx,
+                                                        subport_seg_id)
+            self.ensure_interface_in_vpp_bridge(net_br_idx, subport_if_idx)
+            # set subport tag, so we can find it during resyncs
+            self.vpp.set_interface_tag(subport_if_idx, subport_tag)
+            LOG.debug("Bound subport in vpp with sw_idx: %s on BD: %s ",
+                      subport_if_idx, net_br_idx)
+        # Add subport props to interfaces along with parent port uuid
+        self.interfaces[subport_uuid] = {'iface_idx': subport_if_idx,
+                                         'net_data': net_data,
+                                         'mac': parent_props['mac'],
+                                         'bind_type': 'vhostuser',
+                                         'path': parent_props['path'],
+                                         'parent_uuid': parent_port
+                                         }
+
+        if 'trunk' not in parent_props:
+            LOG.debug('Setting trunk attr value in parent port props for '
+                      'subport %s', subport_uuid)
+            parent_props['trunk'] = set([subport_uuid])
+        else:
+            LOG.debug('Adding subport to trunk parent props for subport %s ',
+                      subport_uuid)
+            parent_props['trunk'].add(subport_uuid)
+        return self.interfaces[subport_uuid]
+
+    def unbind_subport_on_host(self, subport):
+        """Unbind the vhostuser subport in VPP."""
+        if subport not in self.interfaces:
+            LOG.debug('unknown subport %s unbinding request - ignored',
+                      subport)
+        else:
+            LOG.debug("Unbinding subport %s on host", subport)
+            parent_port = self.interfaces[subport]['parent_uuid']
+            LOG.debug("Parent port id of subport %s is %s",
+                      subport, parent_port)
+            self.unbind_interface_on_host(subport)
+            self.interfaces[parent_port]['trunk'].remove(subport)
 
     def clean_interface_from_vpp(self, uuid, props):
+        # Don't unbind a trunk port with subports
+        if 'trunk' in props and len(props['trunk']) > 0:
+            LOG.debug('Waiting for subports %s to be unbound before '
+                      'unbinding trunk port %s', props, uuid)
+            return
         iface_idx = props['iface_idx']
 
         LOG.debug('unbinding port %s, recorded as type %s',
@@ -935,53 +1168,65 @@ class VPPForwarder(object):
         # because the VM's memory (hugepages) will not be
         # released.  So, here, we destroy it.
 
+        # GPE code in VPP does not clean up its data structures
+        # properly if the port
+        # is deleted from the bridge without first removing the
+        # local GPE eid mapping. So remove local mapping,
+        # if we are bound using GPE
+
+        if props['net_data']['network_type'] == TYPE_GPE \
+                and self.gpe is not None:
+            mac = props['mac']
+            seg_id = props['net_data']['segmentation_id']
+            self.gpe.delete_local_gpe_mapping(seg_id, mac)
+
         if props['bind_type'] == 'vhostuser':
             # remove port from bridge (sets to l3 mode) prior to deletion
             self.vpp.delete_from_bridge(iface_idx)
-            self.vpp.delete_vhostuser(iface_idx)
+            # If it is a subport of a trunk port then delete the corresponding
+            # vlan sub-interface. Otherwise it is a parent port or a normal
+            # vhostuser port and we delete the vhostuser interface itself.
+            if 'parent_uuid' not in props:
+                self.vpp.delete_vhostuser(iface_idx)
+            else:
+                self.vpp.delete_vlan_subif(iface_idx)
             # Delete port from vpp_acl map if present
             if iface_idx in self.port_vpp_acls:
                 del self.port_vpp_acls[iface_idx]
             # This interface is no longer connected if it's deleted
             # RACE, as we may call unbind BEFORE the vhost user
             # interface is notified as connected to qemu
-            if iface_idx in self.iface_connected:
-                self.iface_connected.remove(iface_idx)
-        elif props['bind_type'] in ['maketap', 'plugtap']:
+            self.vhostuser_unlink(uuid)
+        elif props['bind_type'] == 'tap':
             # remove port from bridge (sets to l3 mode) prior to deletion
             self.vpp.delete_from_bridge(iface_idx)
             self.vpp.delete_tap(iface_idx)
-            if props['bind_type'] == 'plugtap':
-                bridge_name = get_bridge_name(uuid)
 
-                class FailableBridgeDevice(bridge_lib.BridgeDevice):
-                    # For us, we expect failing commands and want them ignored.
-                    def _brctl(self, cmd):
-                        cmd = ['brctl'] + cmd
-                        ip_wrapper = ip_lib.IPWrapper(self.namespace)
-                        return ip_wrapper.netns.execute(
-                            cmd,
-                            check_exit_code=False,
-                            log_fail_as_error=False,
-                            run_as_root=True
-                        )
-                bridge = FailableBridgeDevice(bridge_name)
-                if bridge.exists():
-                    # These may fail, don't care much
-                    if bridge.owns_interface(props['int_tap_name']):
-                        bridge.delif(props['int_tap_name'])
-                    if bridge.owns_interface(props['ext_tap_name']):
-                        bridge.delif(props['ext_tap_name'])
-                    bridge.link.set_down()
-                    bridge.delbr()
+            bridge_name = get_bridge_name(uuid)
+
+            class FailableBridgeDevice(bridge_lib.BridgeDevice):
+                # For us, we expect failing commands and want them ignored.
+                def _brctl(self, cmd):
+                    cmd = ['brctl'] + cmd
+                    ip_wrapper = ip_lib.IPWrapper(self.namespace)
+                    return ip_wrapper.netns.execute(
+                        cmd,
+                        check_exit_code=False,
+                        log_fail_as_error=False,
+                        run_as_root=True
+                    )
+            bridge = FailableBridgeDevice(bridge_name)
+            if bridge.exists():
+                # These may fail, don't care much
+                if bridge.owns_interface(props['int_tap_name']):
+                    bridge.delif(props['int_tap_name'])
+                if bridge.owns_interface(props['ext_tap_name']):
+                    bridge.delif(props['ext_tap_name'])
+                bridge.link.set_down()
+                bridge.delbr()
         else:
             LOG.error('Unknown port type %s during unbind',
                       props['bind_type'])
-        # If network_type=vxlan delete local vni to mac gpe mapping
-        if props['net_data']['network_type'] == 'vxlan':
-            mac = props['mac']
-            seg_id = props['net_data']['segmentation_id']
-            self.delete_local_gpe_mapping(seg_id, mac)
         self.interfaces.pop(uuid)
 
     def _to_acl_rule(self, r, d, a=2):
@@ -1029,6 +1274,11 @@ class VPPForwarder(object):
             if r.port_min == -1:  # All ICMP Types and Codes [0-255]
                 acl_rule['srcport_or_icmptype_first'] = 0
                 acl_rule['srcport_or_icmptype_last'] = 255
+                acl_rule['dstport_or_icmpcode_first'] = 0
+                acl_rule['dstport_or_icmpcode_last'] = 255
+            elif r.port_max == -1:  # All ICMP codes for an ICMP Type
+                acl_rule['srcport_or_icmptype_first'] = r.port_min
+                acl_rule['srcport_or_icmptype_last'] = r.port_min
                 acl_rule['dstport_or_icmpcode_first'] = 0
                 acl_rule['dstport_or_icmpcode_last'] = 255
             else:  # port_min == ICMP Type and port_max == ICMP Code
@@ -1178,6 +1428,10 @@ class VPPForwarder(object):
                     for acl_idx in secgroup_acls:
                         self.vpp.acl_delete(acl_index=acl_idx)
                     del self.secgroups[secgroup]
+                    # Discard the security group from the remote group dict
+                    for remote_group in self.remote_group_secgroups:
+                        self.remote_group_secgroups[
+                            remote_group].discard(secgroup)
             except Exception as e:
                 LOG.exception("Exception while deleting ACL %s", e)
                 # We could defer this again but it's probably better
@@ -1242,6 +1496,8 @@ class VPPForwarder(object):
                       "to acl mapping. Possible reason: vpp "
                       "may have been restarted on host.")
 
+        # py3 note: in py3 keys() does not return a list but the following
+        # seems to work fine. Enclose in list() is problems arise.
         return self.secgroups.keys()
 
     def get_secgroup_acl_map(self):
@@ -1314,8 +1570,9 @@ class VPPForwarder(object):
 
         Arguments -
         vpp_acls - a list of VppAcl(in_idx, out_idx) namedtuples to be set
-                   on the interface. An empty list '[]' deletes all acls
-                   from the interface
+                   on the interface. An empty list '[]' deletes all user
+                   defined acls from the interface and retains only the spoof
+                   ACL
         """
         # Initialize lists with anti-spoofing vpp acl indices
         spoof_acl = self.spoof_filter_on_host()
@@ -1350,7 +1607,7 @@ class VPPForwarder(object):
 
         def _get_ip_version(ip):
             """Return the IP Version i.e. 4 or 6"""
-            return ip_network(unicode(ip)).version
+            return ipnet(ip).version
 
         def _get_ip_prefix_length(ip):
             """Return the IP prefix length value
@@ -1362,7 +1619,7 @@ class VPPForwarder(object):
             i.e. 32 if IPv4 and 128 if IPv6
             if "ip" is an ip_network return its prefix_length
             """
-            return ip_network(unicode(ip)).prefixlen
+            return ipnet(ip).prefixlen
 
         src_mac_mask = _pack_mac('FF:FF:FF:FF:FF:FF')
         mac_ip_rules = []
@@ -1478,12 +1735,14 @@ class VPPForwarder(object):
                  an IPv4 or IPv6 network with prefix_length e.g. 1.1.1.0/24
         """
         # Works for both addresses and the net address of masked networks
-        return ip_network(unicode(ip_addr)).network_address.packed
+        return ipnet(ip_addr).network_address.packed
 
     def _get_snat_indexes(self, floatingip_dict):
-        """Return the internal and external SNAT interface indexes.
+        """Return the internal and external interface indices for SNAT.
 
-        If needed the external subinterface will be created.
+        Ensure the internal n/w, external n/w and their corresponding
+        BVI loopback interfaces are present, before returning their
+        index values.
         """
 
         # Get internal network details.
@@ -1491,20 +1750,19 @@ class VPPForwarder(object):
             floatingip_dict['internal_physnet'],
             floatingip_dict['internal_net_type'],
             floatingip_dict['internal_segmentation_id'])
-        if internal_network_data:
-            net_br_idx = internal_network_data['bridge_domain_id']
-
-            # if needed the external subinterface will be created.
-            external_if_name, external_if_idx = self.get_if_for_physnet(
-                floatingip_dict['external_physnet'])
-            external_if_idx = self._get_external_vlan_subif(
-                external_if_name, external_if_idx,
-                floatingip_dict['external_segmentation_id'])
-
-            # Return the internal and external interface indexes.
-            return (self.vpp.get_bridge_bvi(net_br_idx), external_if_idx)
+        # Get the external network details
+        external_network_data = self.ensure_network_on_host(
+            floatingip_dict['external_physnet'],
+            floatingip_dict['external_net_type'],
+            floatingip_dict['external_segmentation_id'])
+        if internal_network_data and external_network_data:
+            int_br_idx = internal_network_data['bridge_domain_id']
+            ext_br_idx = external_network_data['bridge_domain_id']
+            # Return the internal and external BVI loopback intf indxs.
+            return (self.ensure_bridge_bvi(int_br_idx),
+                    self.ensure_bridge_bvi(ext_br_idx))
         else:
-            LOG.error('Failed to get internal network data.')
+            LOG.error('Failed to ensure network on host while setting SNAT')
             return None, None
 
     def _delete_external_subinterface(self, floatingip_dict):
@@ -1524,7 +1782,7 @@ class VPPForwarder(object):
                     external_physnet, external_net_type,
                     external_segmentation_id)
 
-    def _get_external_vlan_subif(self, if_name, if_idx, seg_id):
+    def _ensure_external_vlan_subif(self, if_name, if_idx, seg_id):
         sub_if = self.vpp.get_vlan_subif(if_name, seg_id)
         if not sub_if:
             # Create a VLAN subif
@@ -1533,196 +1791,632 @@ class VPPForwarder(object):
 
         return sub_if
 
-    def create_router_external_gateway_on_host(self, router):
-        """Creates the external gateway for the router.
+    def _get_loopback_mac(self, loopback_idx):
+        """Returns the mac address of the loopback interface."""
+        loopback_mac = self.vpp.get_ifidx_mac_address(loopback_idx)
+        LOG.debug("mac address %s of the router BVI loopback idx: %s",
+                  loopback_mac, loopback_idx)
+        return loopback_mac
 
-        Add the specified external gateway IP address as a SNAT
-        external IP address within the router's VRF.
-        """
-        if_name, if_idx = self.get_if_for_physnet(router['external_physnet'])
-        # Set the external physnet/subif as a SNAT outside interface
-        if router['external_net_type'] == p_const.TYPE_VLAN:
-            if_idx = self._get_external_vlan_subif(
-                if_name, if_idx, router['external_segment'])
-        elif router['external_net_type'] == p_const.TYPE_FLAT:
-            # Use the ifidx grabbed earlier
-            pass
-        else:
-            # Unsupported segmentation type
-            LOG.warning("Unsupported segmentation type for "
-                        "external networks %s",
-                        router['external_net_type'])
-            return False
+    def ensure_bridge_bvi(self, bridge_idx):
+        """Ensure a BVI loopback interface for the bridge."""
+        bvi_if_idx = self.vpp.get_bridge_bvi(bridge_idx)
+        if not bvi_if_idx:
+            bvi_if_idx = self.vpp.create_loopback()
+            self.vpp.set_loopback_bridge_bvi(bvi_if_idx, bridge_idx)
+        return bvi_if_idx
 
-        # Check if this interface is already set to outside
-        intf_list = self.vpp.get_snat_interfaces()
-        if if_idx not in intf_list:
-            self.vpp.set_snat_on_interface(if_idx, is_inside=0)
-
-        # Grab all snat and physnet addresses
-        addrs = self.vpp.get_snat_addresses()
-        physnet_ip_addrs = self.vpp.get_interface_ip_addresses(if_idx)
-
-        for addr in router['gateways']:
-            if addr[0] not in addrs:
-                self.vpp.add_del_snat_address(
-                    self._pack_address(addr[0]), router['vrf_id'])
-
-            # Set the Subnet gateway as external network gateway address
-            # Check if this address is already set on the external
-            if str(addr[0]) not in [ip[0] for ip in physnet_ip_addrs]:
-                # Set this itnerface to VRF 0
-                self.vpp.set_interface_vrf(if_idx, 0)
-                self.vpp.set_interface_ip(
-                    if_idx, self._pack_address(addr[0]), int(addr[1]))
-
-    def delete_router_external_gateway_on_host(self, router):
-        """Delete the external IP address from the router.
-
-        Deletes the specified external gateway IP address from the
-        SNAT external IP pool from this router's VRF.
-        """
-        if_name, if_idx = self.get_if_for_physnet(router['external_physnet'])
-        if router['external_net_type'] == p_const.TYPE_VLAN:
-            if_idx = self.vpp.get_vlan_subif(
-                if_name, router['external_segment'])
-        elif router['external_net_type'] == p_const.TYPE_FLAT:
-            # Use physnet id_idx found earlier
-            pass
-        else:
-            # Unsupported type
-            LOG.warning("Unsupported segmentation type for "
-                        "external networks %s",
-                        router['external_net_type'])
-            return False
-
-        # Grab all snat and physnet addresses
-        addrs = self.vpp.get_snat_addresses()
-        if if_idx:
-            physnet_ip_addrs = self.vpp.get_interface_ip_addresses(if_idx)
-
-        for addr in router['gateways']:
-            # Delete external snat addresses for the router
-            if addr[0] in addrs:
-                self.vpp.add_del_snat_address(
-                    self._pack_address(addr[0]), router['vrf_id'],
-                    is_add=False)
-
-            # Delete router external gateway from external interface
-            if if_idx:
-                if str(addr[0]) in [ip[0] for ip in physnet_ip_addrs]:
-                    self.vpp.del_interface_ip(
-                        if_idx, self._pack_address(addr[0]), int(addr[1]))
-
-        # Delete the subinterface if type VLAN
-        if router['external_net_type'] == p_const.TYPE_VLAN and if_idx:
-            self.vpp.delete_vlan_subif(if_idx)
-
-    def create_router_interface_on_host(self, router):
-        """Create a router on the local host.
+    def ensure_router_interface_on_host(self, port_id, router_data):
+        """Ensure a router interface on the local host.
 
         Creates a loopback interface and sets the bridge's BVI to the
-        loopback interface to act as an L3 gateway for the bridge network.
+        loopback interface to act as an L3 gateway for the network.
+        For external networks, the BVI functions as an SNAT external
+        interface. For updating an interface, the service plugin removes
+        the old interface and then adds the new router interface. If an
+        external gateway exists, ensures a local route in VPP.
+
+        When Layer3 HA is enabled, the router interfaces are only enabled on
+        the active VPP router. The standby router keeps the interface in
+        an admin down state.
         """
-        net_data = self.ensure_network_on_host(
-            router['physnet'], router['net_type'], router['segmentation_id'])
-        net_br_idx = net_data['bridge_domain_id']
+        # The interface could be either an external_gw or an internal router
+        # interface on a subnet
+        # Enable SNAT by default unless it is set to False
+        enable_snat = True
+        # Multiple routers on a shared external subnet is supported
+        # by adding local routes in VPP.
+        is_local = 0  # True for local-only VPP routes.
+        # Create an external interfce if the external_gateway_info key is
+        # present, else create an internal interface
+        if router_data.get('external_gateway_info', False):
+            seg_id = router_data['external_segmentation_id']
+            net_type = router_data['external_net_type']
+            physnet = router_data['external_physnet']
+            vrf = 0
+            is_inside = 0
+            enable_snat = router_data['external_gateway_info']['enable_snat']
+            external_gateway_ip = router_data['external_gateway_ip']
+            # To support multiple IP addresses on a router port, add
+            # the router to each of the subnets.
+            gateway_ip = router_data['gateways'][0][0]
+            prefixlen = router_data['gateways'][0][1]
+            is_ipv6 = router_data['gateways'][0][2]
+        else:
+            seg_id = router_data['segmentation_id']
+            net_type = router_data['net_type']
+            physnet = router_data['physnet']
+            vrf = router_data['vrf_id']
+            is_inside = 1
+            external_gateway_ip = None
+            gateway_ip = router_data['gateway_ip']
+            prefixlen = router_data['prefixlen']
+            is_ipv6 = router_data['is_ipv6']
+        # Ensure the network exists on host and get the network data
+        net_data = self.ensure_network_on_host(physnet, net_type, seg_id)
+        # Get the bridge domain id and ensure a BVI interface for it
+        bridge_idx = net_data['bridge_domain_id']
+        # Ensure a BVI (i.e. A loopback) for the bridge domain
+        loopback_idx = self.vpp.get_bridge_bvi(bridge_idx)
+        # Create a loopback BVI interface
+        if not loopback_idx:
+            # Create the loopback interface, but don't bring it UP yet
+            loopback_idx = self.ensure_bridge_bvi(bridge_idx)
+        # Set the VRF for tenant BVI interfaces, if not already set
+        if vrf and not self.vpp.get_interface_vrf(loopback_idx) == vrf:
+            self.vpp.set_interface_vrf(loopback_idx, vrf, is_ipv6)
+        # Make a best effort to set the MTU on the interface
+        try:
+            self.vpp.set_interface_mtu(loopback_idx, router_data['mtu'])
+        except SystemExit:
+            # Log error and continue, do not exit here
+            LOG.error("Error setting MTU on router interface")
+        # Get the mac address for the route BVI loopback interface
+        loopback_mac = self._get_loopback_mac(loopback_idx)
+        ha_enabled = cfg.CONF.ml2_vpp.enable_l3_ha
+        if ha_enabled:
+            # Now bring up the loopback interface, if this router is the
+            # ACTIVE router. Also populate the data structure
+            # router_interface_states so the HA code can activate and
+            # deactivate the interface
+            if self.router_state:
+                LOG.debug("Router HA state is ACTIVE")
+                LOG.debug("Bringing UP the router intf idx: %s", loopback_idx)
+                self.vpp.ifup(loopback_idx)
+                self.router_interface_states[loopback_idx] = 1
+            else:
+                LOG.debug("Router HA state is BACKUP")
+                LOG.debug("Bringing DOWN the router intf idx: %s",
+                          loopback_idx)
+                self.vpp.ifdown(loopback_idx)
+                self.router_interface_states[loopback_idx] = 0
+            LOG.debug("Current router interface states: %s",
+                      self.router_interface_states)
+        else:
+            self.vpp.ifup(loopback_idx)
+        # Set SNAT on the interface if SNAT is enabled
         # Get a list of all SNAT interfaces
         int_list = self.vpp.get_snat_interfaces()
-        # Check if a loopback is already set as the BVI for this bridge
-        br_bvi = self.vpp.get_bridge_bvi(net_br_idx)
-        if br_bvi:
-            # Grab the BVI interface index
-            loopback_idx = br_bvi
-        else:
-            loopback_idx = self.vpp.create_loopback(router['loopback_mac'])
-            self.vpp.set_loopback_bridge_bvi(loopback_idx, net_br_idx)
-            self.vpp.set_interface_vrf(loopback_idx, router['vrf_id'],
-                                       router['is_ipv6'])
-            # MTU setting could be turned off in the config, make a best
-            # effort to set it in that case
-            try:
-                self.vpp.set_interface_mtu(loopback_idx, router['mtu'])
-            except SystemExit:
-                # Log error and continue, do not exit here
-                LOG.error("Error setting MTU on router interface")
+        if loopback_idx not in int_list and enable_snat:
+            self.vpp.set_snat_on_interface(loopback_idx, is_inside)
+            # Set the SNAT 1:N overload on the external loopback interface
+            if not is_inside:
+                self.vpp.snat_overload_on_interface_address(loopback_idx)
 
-            # Set this BVI as an inside SNAT interface
-            # Only if it's not already set
-            if loopback_idx not in int_list:
-                self.vpp.set_snat_on_interface(loopback_idx)
-
-        # Check if the BVI interface has the IP address for this
-        # subnet's gateway
+        # Add GPE mappings for GPE type networks only on the master
+        # node, if ha_enabled
+        if net_type == TYPE_GPE and self.gpe is not None:
+            if (ha_enabled and self.router_state) or not ha_enabled:
+                self.gpe.add_local_gpe_mapping(seg_id, loopback_mac)
+        # Set the gateway IP address on the BVI interface, if not already set
         addresses = self.vpp.get_interface_ip_addresses(loopback_idx)
-        found = False
+        gw_ip_obj = ipaddr(gateway_ip)
+        # Is there another gateway ip_addr set on this external loopback?
+        if not is_inside:
+            exists_gateway = any((addr for addr, _ in addresses
+                                  if addr != gw_ip_obj))
+            if exists_gateway:
+                LOG.debug('A router gateway exists on the external network.'
+                          'The current router gateway IP: %s will be added as '
+                          'a local VPP route', str(gw_ip_obj))
         for address in addresses:
-            if address[0] == str(router['gateway_ip']):
-                found = True
+            if address[0] == gw_ip_obj:
                 break
+        else:
+            # Add a local VRF route if another external gateway exists
+            if not is_inside and exists_gateway:
+                is_local = 1
+                ip_prefix_length = 32 if gw_ip_obj.version == 4 else 128
+                # Add a local IP route if it doesn't exist
+                self.vpp.add_ip_route(vrf=vrf,
+                                      ip_address=self._pack_address(
+                                          gateway_ip),
+                                      prefixlen=ip_prefix_length,
+                                      next_hop_address=None,
+                                      next_hop_sw_if_index=None,
+                                      is_ipv6=is_ipv6,
+                                      is_local=is_local)
+            else:
+                self.vpp.set_interface_ip(
+                    loopback_idx, self._pack_address(gateway_ip), prefixlen,
+                    is_ipv6)
 
-        if not found:
-            # Add this IP address to this BVI interface
-            self.vpp.set_interface_ip(loopback_idx,
-                                      self._pack_address(router['gateway_ip']),
-                                      router['prefixlen'], router['is_ipv6'])
+        router_dict = {
+            'segmentation_id': seg_id,
+            'physnet': physnet,
+            'net_type': net_type,
+            'bridge_domain_id': bridge_idx,
+            'bvi_if_idx': loopback_idx,
+            'gateway_ip': gateway_ip,
+            'prefixlen': prefixlen,
+            'is_ipv6': is_ipv6,
+            'mac_address': loopback_mac,
+            'is_inside': is_inside,
+            'external_gateway_ip': external_gateway_ip,
+            'vrf_id': vrf,
+            'uplink_idx': net_data.get('if_uplink_idx'),
+            'is_local': is_local
+            }
+        if is_inside:
+            LOG.debug("Router: Created inside router port: %s",
+                      router_dict)
+            self.router_interfaces[port_id] = router_dict
+            # Ensure that all gateway networks are exported into this
+            # tenant VRF &
+            # A default route exists in this VRF to the external gateway
+            self.export_routes_from_tenant_vrfs(
+                source_vrf=router_dict['vrf_id'])
+        else:
+            LOG.debug("Router: Created outside router port: %s",
+                      router_dict)
+            self.router_external_interfaces[port_id] = router_dict
+            # TODO(onong):
+            # The current VPP NAT implementation supports only one outside
+            # FIB table and by default it uses table 0, ie, the default vrf.
+            # So, this is a temporary workaround to tide over the limitation.
+            if not is_local:
+                self.default_route_in_default_vrf(router_dict)
+            # Ensure that the gateway network is exported into all tenant
+            # VRFs, with the correct default routes
+                self.export_routes_from_tenant_vrfs(
+                    ext_gw_ip=router_dict['external_gateway_ip'])
         return loopback_idx
 
-    def delete_router_interface_on_host(self, router):
-        """Deletes a router from the host.
+    def become_master_router(self):
+        """This node will become the master router"""
+        LOG.debug("VPP becoming the master router..")
+        LOG.debug("Current router interface states: %s",
+                  self.router_interface_states)
+        for idx in self.router_interface_states:
+            if not self.router_interface_states[idx]:
+                LOG.debug("Bringing UP the router interface: %s", idx)
+                # TODO(najoy): Bring up intf. only if not set to admin DOWN
+                self.vpp.ifup(idx)
+                self.router_interface_states[idx] = 1
+        LOG.debug("New router interface states: %s",
+                  self.router_interface_states)
 
-        Deletes a loopback interface from the host, this removes the BVI
-        interface from the local bridge.
+    def become_backup_router(self):
+        """This node will become the backup router"""
+        LOG.debug("VPP becoming the standby router..")
+        LOG.debug("Current router interface states: %s",
+                  self.router_interface_states)
+        for idx in self.router_interface_states:
+            if self.router_interface_states[idx]:
+                LOG.debug("Bringing DOWN the router interface: %s", idx)
+                self.vpp.ifdown(idx)
+                self.router_interface_states[idx] = 0
+        LOG.debug("New router interface states: %s",
+                  self.router_interface_states)
+
+    def _get_ip_network(self, gateway_ip, prefixlen):
+        """Returns the IP network for the gateway in CIDR form."""
+        return str(ipint(gateway_ip + "/" + str(prefixlen)).network)
+
+    def default_route_in_default_vrf(self, router_dict, is_add=True):
+        # ensure that default route in default VRF is present
+        if is_add:
+            self.vpp.add_ip_route(
+                vrf=router_dict['vrf_id'],
+                ip_address=self._pack_address('0.0.0.0'),
+                prefixlen=0,
+                next_hop_address=self._pack_address(
+                    router_dict['external_gateway_ip']),
+                next_hop_sw_if_index=router_dict['bvi_if_idx'],
+                is_ipv6=router_dict['is_ipv6'])
+        else:
+            self.vpp.delete_ip_route(
+                vrf=router_dict['vrf_id'],
+                ip_address=self._pack_address('0.0.0.0'),
+                prefixlen=0,
+                next_hop_address=self._pack_address(
+                    router_dict['external_gateway_ip']),
+                next_hop_sw_if_index=router_dict['bvi_if_idx'],
+                is_ipv6=router_dict['is_ipv6'])
+
+    def export_routes_from_tenant_vrfs(self, source_vrf=0, is_add=True,
+                                       ext_gw_ip=None):
+        """Exports the external gateway into the tenant VRF.
+
+        The gateway network has to be exported into the tenant VRF for
+        it to communicate with the outside world. Also a default route
+        has to be set to the external gateway IP address.
+        If source_vrf (i.e tenant VRF) is provided,
+           - Export the external gateway's IP from VRF=0 into this VRF.
+           - Add a default route to the external_gateway in this VRF
+        Else,
+           - Export the external gateway into into all tenant VRFs
+           - Add a default route to the external_gateway in all tenant VRFs
+        If the external gateway IP address is not provided:
+        All external networks are exported into tenant VRFs
+
         """
-        net_data = self.ensure_network_on_host(
-            router['physnet'], router['net_type'], router['segmentation_id'])
-        net_br_idx = net_data['bridge_domain_id']
-        bvi_if_idx = self.vpp.get_bridge_bvi(net_br_idx)
-        # Get bvi interface from bridge details
-        if bvi_if_idx:
-            # Get all IP's assigned to the BVI interface
-            addresses = self.vpp.get_interface_ip_addresses(bvi_if_idx)
-            if len(addresses) > 1:
-                # Dont' delete the BVI, only remove one IP from it
-                self.vpp.del_interface_ip(
-                    bvi_if_idx, self._pack_address(router['gateway_ip']),
-                    router['prefixlen'], router['is_ipv6'])
+        if source_vrf:
+            LOG.debug("Router:Exporting external route into tenant VRF:%s",
+                      source_vrf)
+        else:
+            LOG.debug("Router:Exporting external route into all tenant VRFs")
+        # TODO(najoy): Check if the tenant ID matches for the gateway router
+        # external interface and export only matching external routes.
+        for ext_port in self.router_external_interfaces:
+            gw_port = self.router_external_interfaces[ext_port]
+            for int_port in self.router_interfaces.values():
+                int_vrf = int_port['vrf_id']
+                ext_vrf = gw_port['vrf_id']
+                # If a source vrf is present only update if the VRF matches
+                if source_vrf and int_vrf != source_vrf:
+                    continue
+                is_ipv6 = int_port['is_ipv6']
+                default_gw_ip = "::" if is_ipv6 else '0.0.0.0'
+                external_gateway_ip = gw_port['external_gateway_ip']
+                if ext_gw_ip and external_gateway_ip != ext_gw_ip:
+                    continue
+                # Get the external and internal networks in the CIDR form
+                ext_network = self._get_ip_network(
+                    gw_port['gateway_ip'],
+                    gw_port['prefixlen']
+                    )
+                int_network = self._get_ip_network(
+                    int_port['gateway_ip'],
+                    int_port['prefixlen']
+                    )
+                if is_add:
+                    # Add the default route (0.0.0.0/0) to the
+                    # external gateway IP addr, which is outside of VPP
+                    # with the next hop sw_if_index set to the external
+                    # loopback BVI address.
+                    # Note: The external loopback sw_if_index and the
+                    # next_hop_address is mandatory here to prevent a VPP
+                    # crash - Similar to the CLI command
+                    # ip route add table <int-vrf> 0.0.0.0/0 via <next-hop-ip>
+                    #                                    <next-hop-sw-indx>
+                    self.vpp.add_ip_route(
+                        vrf=int_vrf,
+                        ip_address=self._pack_address(default_gw_ip),
+                        prefixlen=0,
+                        next_hop_address=self._pack_address(
+                            external_gateway_ip),
+                        next_hop_sw_if_index=gw_port['bvi_if_idx'],
+                        is_ipv6=is_ipv6)
+                    # Export the external gateway subnet into the tenant VRF
+                    # to enable tenant traffic to flow out. Exporting is done
+                    # by setting the next hop sw if index to the loopback's
+                    # sw_index (i.e. BVI) on the external network
+                    # CLI: ip route add table <int_vrf> <external-subnet>
+                    #                                 via <next-hop-sw-indx>
+                    self.vpp.add_ip_route(
+                        vrf=int_vrf,
+                        ip_address=self._pack_address(ext_network),
+                        prefixlen=gw_port['prefixlen'],
+                        next_hop_address=None,
+                        next_hop_sw_if_index=gw_port['bvi_if_idx'],
+                        is_ipv6=is_ipv6)
+                    # Export the tenant network into external VRF so the
+                    # gateway can route return traffic to the tenant VM from
+                    # the Internet.
+                    # CLI: ip route add table 0 <tenant-subnet> via
+                    #                                <tenant-loopback-bvi>
+                    self.vpp.add_ip_route(
+                        vrf=ext_vrf,
+                        ip_address=self._pack_address(int_network),
+                        prefixlen=int_port['prefixlen'],
+                        next_hop_address=None,
+                        next_hop_sw_if_index=int_port['bvi_if_idx'],
+                        is_ipv6=is_ipv6)
+                else:
+                    self.vpp.delete_ip_route(
+                        vrf=int_vrf,
+                        ip_address=self._pack_address(default_gw_ip),
+                        prefixlen=0,
+                        next_hop_address=self._pack_address(
+                            external_gateway_ip),
+                        next_hop_sw_if_index=gw_port['bvi_if_idx'],
+                        is_ipv6=is_ipv6)
+                    # Delete the exported route in tenant VRF
+                    self.vpp.delete_ip_route(
+                        vrf=int_vrf,
+                        ip_address=self._pack_address(ext_network),
+                        prefixlen=gw_port['prefixlen'],
+                        next_hop_address=None,
+                        next_hop_sw_if_index=gw_port['bvi_if_idx'],
+                        is_ipv6=is_ipv6)
+                    # Delete the exported route from the external VRF
+                    self.vpp.delete_ip_route(
+                        vrf=ext_vrf,
+                        ip_address=self._pack_address(int_network),
+                        prefixlen=int_port['prefixlen'],
+                        next_hop_address=None,
+                        next_hop_sw_if_index=int_port['bvi_if_idx'],
+                        is_ipv6=is_ipv6)
+
+    def delete_router_interface_on_host(self, port_id):
+        """Deletes a router interface from the host.
+
+        Disables SNAT, if it is set on the interface.
+        Deletes a loopback interface from the host, this removes the BVI
+        interface from the local bridge. Also, delete the default route and
+        SNAT address for the external interface.
+        """
+        is_external = 0
+
+        if port_id in self.router_interfaces:
+            router = self.router_interfaces[port_id]
+        elif port_id in self.router_external_interfaces:
+            router = self.router_external_interfaces[port_id]
+            is_external = 1
+            ext_intf_ip = six.u('{}/{}'.format(router['gateway_ip'],
+                                               router['prefixlen']))
+            # Get all local IP addresses in the external VRF belonging
+            # to the same external subnet as this router.
+            # Check if atleast one local_ip matches a neutron assigned
+            # external IP address of the router.
+            # If there's no match, there are no valid local IPs within VPP.
+            local_gw_ips = [r['gateway_ip'] for
+                            r in self.router_external_interfaces.values()
+                            if r['is_local']]
+            for local_ip in self.vpp.get_local_ip_address(ext_intf_ip,
+                                                          router['is_ipv6'],
+                                                          router['vrf_id']):
+                # Is the local_ip valid?
+                if local_ip in local_gw_ips:
+                    LOG.debug('Found a router external local_ip in VPP: %s',
+                              local_ip)
+                    local_ip = [local_ip]
+                    break
+            # For-else would mean no breaks i.e. no valid local_ips
             else:
-                # Last subnet assigned, delete the interface
-                self.vpp.delete_loopback(bvi_if_idx)
+                local_ip = []
+        else:
+            LOG.error("Router port:%s deletion error...port not found",
+                      port_id)
+            return False
 
-    def associate_floatingip(self, floatingip_dict):
-        """Add the VPP configuration to support One-to-One SNAT."""
+        net_br_idx = router['bridge_domain_id']
+        bvi_if_idx = self.vpp.get_bridge_bvi(net_br_idx)
+        # If an external local route, we can safetly delete it from VPP
+        # Don't delete any SNAT
+        if is_external and router['is_local']:
+            LOG.debug("delete_router_intf: Removing the local route: %s/32",
+                      router['gateway_ip'])
+            prefixlen = 128 if router['is_ipv6'] else 32
+            self.vpp.delete_ip_route(vrf=router['vrf_id'],
+                                     ip_address=self._pack_address(
+                                         router['gateway_ip']),
+                                     prefixlen=prefixlen,
+                                     next_hop_address=None,
+                                     next_hop_sw_if_index=None,
+                                     is_ipv6=router['is_ipv6'],
+                                     is_local=1)
+        # External router is a loopback BVI. If a local route exists,
+        # replace the BVI's IP address with its IP address.
+        # Don't delete the SNAT.
+        elif is_external and len(local_ip) > 0:
+            local_ip = local_ip[0]
+            LOG.debug('delete_router_intf: replacing router loopback BVI IP '
+                      'address %s with the local ip address %s',
+                      router['gateway_ip'], local_ip)
+            # Delete the IP address from the BVI.
+            self.vpp.del_interface_ip(
+                bvi_if_idx, self._pack_address(router['gateway_ip']),
+                router['prefixlen'], router['is_ipv6'])
+            # Delete the local route
+            prefixlen = 128 if router['is_ipv6'] else 32
+            self.vpp.delete_ip_route(vrf=router['vrf_id'],
+                                     ip_address=self._pack_address(local_ip),
+                                     prefixlen=prefixlen,
+                                     next_hop_address=None,
+                                     next_hop_sw_if_index=None,
+                                     is_ipv6=router['is_ipv6'],
+                                     is_local=1)
+            self.vpp.set_interface_ip(bvi_if_idx,
+                                      self._pack_address(local_ip),
+                                      router['prefixlen'],
+                                      router['is_ipv6'])
+            # Set the router external interface corresponding to the local
+            # route as non-local.
+            for router in self.router_external_interfaces.values():
+                if ipaddr(router['gateway_ip']) == \
+                    ipaddr(local_ip):
+                        router['is_local'] = 0
+                        LOG.debug('Router external %s is no longer a local '
+                                  'route but now assigned to the BVI', router)
+        else:
+            # At this point, we can safetly remove both the SNAT and BVI
+            # loopback interfaces as no local routes exist.
+            snat_interfaces = self.vpp.get_snat_interfaces()
+            # Get SNAT out interfaces whose IP addrs are overloaded
+            snat_out_interfaces = self.vpp.get_outside_snat_interface_indices()
+            # delete SNAT if set on this interface
+            if router['bvi_if_idx'] in snat_interfaces:
+                LOG.debug('Router: Deleting SNAT on interface '
+                          'index: %s', router['bvi_if_idx'])
+                self.vpp.set_snat_on_interface(router['bvi_if_idx'],
+                                               is_inside=router['is_inside'],
+                                               is_add=False)
+            # Delete the external 1:N SNAT and default routes in all VRFs
+            # for external router interface deletion
+            if not router['is_inside']:
+                LOG.debug('Router: Deleting external gateway port %s for '
+                          'router: %s', port_id, router)
+                # Delete external snat addresses for the router
+                if router['bvi_if_idx'] in snat_out_interfaces:
+                    LOG.debug('Router:Removing 1:N SNAT on external interface '
+                              'index: %s', router['bvi_if_idx'])
+                    self.vpp.snat_overload_on_interface_address(
+                        router['bvi_if_idx'],
+                        is_add=False)
+                # Delete all exported routes into tenant VRFs belonging to this
+                # external gateway
+                self.export_routes_from_tenant_vrfs(
+                    ext_gw_ip=router['external_gateway_ip'], is_add=False)
+                # delete the default route in the default VRF
+                self.default_route_in_default_vrf(router, is_add=False)
+            else:
+                # Delete all exported routes from this VRF
+                self.export_routes_from_tenant_vrfs(source_vrf=router[
+                    'vrf_id'], is_add=False)
+            # Delete the gateway IP address and the BVI interface if this is
+            # the last IP address assigned on the BVI
+            if bvi_if_idx:
+                # Get all IP's assigned to the BVI interface
+                addresses = self.vpp.get_interface_ip_addresses(bvi_if_idx)
+                if len(addresses) > 1:
+                    # Dont' delete the BVI, only remove one IP from it
+                    self.vpp.del_interface_ip(
+                        bvi_if_idx, self._pack_address(router['gateway_ip']),
+                        router['prefixlen'], router['is_ipv6'])
+                else:
+                    # Last subnet assigned, delete the interface
+                    self.vpp.delete_loopback(bvi_if_idx)
+                    if cfg.CONF.ml2_vpp.enable_l3_ha:
+                        self.router_interface_states.pop(bvi_if_idx, None)
+        # Remove any local GPE mappings
+        if router['net_type'] == TYPE_GPE and self.gpe is not None:
+            LOG.debug('Removing local GPE mappings for router '
+                      'interface: %s', port_id)
+            self.gpe.delete_local_gpe_mapping(router['segmentation_id'],
+                                              router['mac_address'])
+        if not is_external:
+            self.router_interfaces.pop(port_id)
+        else:
+            self.router_external_interfaces.pop(port_id)
 
-        # If needed, add the SNAT interfaces.
-        loopback_idx, external_idx = self._get_snat_indexes(floatingip_dict)
+    def maybe_associate_floating_ips(self):
+        """Associate any pending floating IP addresses.
+
+        We may receive a request to associate a floating
+        IP address, when the router BVI interfaces are not ready yet. So,
+        we queue such requests and do the association when the router
+        interfaces are ready.
+        """
+        LOG.debug('Router: maybe associating floating IPs: %s',
+                  self.floating_ips)
+        for floatingip in self.floating_ips:
+            if not self.floating_ips[floatingip]['state']:
+                fixedip_addr = self.floating_ips[
+                    floatingip]['fixed_ip_address']
+                floatingip_addr = self.floating_ips[
+                    floatingip]['floating_ip_address']
+                loopback_idx = self.floating_ips[floatingip]['loopback_idx']
+                external_idx = self.floating_ips[floatingip]['external_idx']
+                self._associate_floatingip(floatingip, fixedip_addr,
+                                           floatingip_addr, loopback_idx,
+                                           external_idx)
+
+    def _associate_floatingip(self, floatingip, fixedip_addr,
+                              floatingip_addr, loopback_idx, external_idx):
+        """Associate the floating ip address and update state."""
+        LOG.debug("Router: associating floatingip:%s with fixedip: %s "
+                  "loopback_idx:%s, external_idx:%s", floatingip_addr,
+                  fixedip_addr, loopback_idx, external_idx)
         snat_interfaces = self.vpp.get_snat_interfaces()
 
         if loopback_idx and loopback_idx not in snat_interfaces:
             self.vpp.set_snat_on_interface(loopback_idx)
         if external_idx and external_idx not in snat_interfaces:
             self.vpp.set_snat_on_interface(external_idx, is_inside=0)
-
+        tenant_vrf = self.vpp.get_interface_vrf(loopback_idx)
+        LOG.debug('Router: Tenant VRF:%s, floating IP:%s and bvi_idx:%s',
+                  tenant_vrf, floatingip_addr, loopback_idx)
         # If needed, add the SNAT internal and external IP address mapping.
         snat_local_ipaddresses = self.vpp.get_snat_local_ipaddresses()
-        if floatingip_dict['fixed_ip_address'] not in snat_local_ipaddresses:
-            self.vpp.set_snat_static_mapping(
-                floatingip_dict['fixed_ip_address'],
-                floatingip_dict['floating_ip_address'])
+        if fixedip_addr not in snat_local_ipaddresses and tenant_vrf:
+            LOG.debug("Router: setting 1:1 SNAT %s:%s in tenant_vrf:%s",
+                      fixedip_addr, floatingip_addr, tenant_vrf)
+            self.vpp.set_snat_static_mapping(fixedip_addr, floatingip_addr,
+                                             tenant_vrf)
+            # Clear any dynamic NAT sessions for the 1:1 NAT to take effect
+            self.vpp.clear_snat_sessions(fixedip_addr)
+            self.floating_ips[floatingip]['tenant_vrf'] = tenant_vrf
+            self.floating_ips[floatingip]['state'] = True
+        LOG.debug('Router: Associated floating IPs: %s', self.floating_ips)
 
-    def disassociate_floatingip(self, floatingip_dict):
-        """Remove the VPP configuration used by One-to-One SNAT."""
+    def associate_floatingip(self, floatingip, floatingip_dict):
+        """Add the VPP configuration to support One-to-One SNAT.
 
-        # Delete the SNAT internal and external IP address mapping.
-        snat_local_ipaddresses = self.vpp.get_snat_local_ipaddresses()
-        if floatingip_dict['fixed_ip_address'] in snat_local_ipaddresses:
-            self.vpp.set_snat_static_mapping(
-                floatingip_dict['fixed_ip_address'],
-                floatingip_dict['floating_ip_address'],
-                is_add=0)
+        Arguments:-
+        floating_ip: The UUID of the floating ip address
+        floatingip_dict : The floating ip data
+        """
+        LOG.debug("Router: Checking for existing association for"
+                  " floating ip: %s", floatingip)
+        if floatingip in self.floating_ips:
+            self.disassociate_floatingip(floatingip)
+        else:
+            LOG.debug("Router: Found no existing association for floating ip:"
+                      " %s", floatingip)
+        LOG.debug('Router: Associating floating ip address: %s: %s',
+                  floatingip, floatingip_dict)
+        loopback_idx, external_idx = self._get_snat_indexes(floatingip_dict)
+        LOG.debug('Router: Retrieved floating ip intf indxs- int:%s, ext:%s',
+                  loopback_idx, external_idx)
+        self.floating_ips[floatingip] = {
+            'fixed_ip_address': floatingip_dict['fixed_ip_address'],
+            'floating_ip_address': floatingip_dict['floating_ip_address'],
+            'loopback_idx': loopback_idx,
+            'external_idx': external_idx,
+            'state': False
+            }
+        tenant_vrf = self.vpp.get_interface_vrf(loopback_idx)
+        # Associate the floating IP iff the router has established a tenant
+        # VRF i.e. a vrf_id > 0
+        if tenant_vrf:
+            LOG.debug("Router: associate_floating_ip: tenant_vrf:%s BVI:%s",
+                      tenant_vrf, loopback_idx)
+            self.floating_ips[floatingip]['tenant_vrf'] = tenant_vrf
+            self._associate_floatingip(floatingip,
+                                       floatingip_dict['fixed_ip_address'],
+                                       floatingip_dict['floating_ip_address'],
+                                       loopback_idx,
+                                       external_idx)
+        else:
+            self.floating_ips[floatingip]['tenant_vrf'] = 'undecided'
 
-        # Check if external subinterface can be deleted.
-        self._delete_external_subinterface(floatingip_dict)
+    def disassociate_floatingip(self, floatingip):
+        """Remove the VPP configuration used by One-to-One SNAT.
+
+        Arguments:-
+        floating_ip: The UUID of the floating ip address to be disassociated.
+        """
+        LOG.debug('Router: Disassociating floating ip address:%s',
+                  floatingip)
+        # Check if we know about this floating ip address
+        floatingip_dict = self.floating_ips.get(floatingip)
+        if floatingip_dict:
+            # Delete the SNAT internal and external IP address mapping.
+            LOG.debug('Router: deleting NAT mappings for floating ip: %s',
+                      floatingip)
+            snat_local_ipaddresses = self.vpp.get_snat_local_ipaddresses()
+            if floatingip_dict['fixed_ip_address'] in snat_local_ipaddresses:
+                self.vpp.set_snat_static_mapping(
+                    floatingip_dict['fixed_ip_address'],
+                    floatingip_dict['floating_ip_address'],
+                    floatingip_dict['tenant_vrf'],
+                    is_add=0)
+            self.floating_ips.pop(floatingip)
+        else:
+            LOG.debug('router: floating ip address: %s not found to be '
+                      'disassociated', floatingip)
 
     def get_spoof_filter_rules(self):
         """Build and return a list of anti-spoofing rules.
@@ -1811,201 +2505,12 @@ class VPPForwarder(object):
         """Get a dump of macip ACLs on the node"""
         return self.vpp.get_macip_acl_dump()
 
-# ################## BEGIN LISP GPE Methods #################################
-    def bridge_idx_for_lisp_segment(self, seg_id):
-        """Generate a bridge domain index for GPE overlay networking
 
-        Use the 65K namespace for GPE bridge-domains to avoid conflicts
-        with other bridge domains and return a unique BD per network segment
-        """
-        return 65000 + seg_id
+LEADIN = nvpp_const.LEADIN  # TODO(ijw): make configurable?
 
-    def ensure_gpe_vni_to_bridge_mapping(self, seg_id, bridge_idx):
-        # Add eid table mapping: vni to bridge-domain
-        if (seg_id, bridge_idx) not in self.vpp.get_lisp_vni_to_bd_mappings():
-            self.vpp.add_lisp_vni_to_bd_mapping(vni=seg_id,
-                                                bridge_domain=bridge_idx)
-
-    def delete_gpe_vni_to_bridge_mapping(self, seg_id, bridge_idx):
-        # Remove vni to bridge-domain mapping in VPP if present
-        if (seg_id, bridge_idx) in self.vpp.get_lisp_vni_to_bd_mappings():
-            self.vpp.del_lisp_vni_to_bd_mapping(vni=seg_id,
-                                                bridge_domain=bridge_idx)
-
-    def ensure_remote_gpe_mapping(self, vni, mac, remote_ip):
-        """Ensures a remote GPE mapping
-
-        A remote GPE mapping contains a remote mac-address, vni and the
-        underlay ip address of the remote node (i.e. remote_ip)
-        """
-        if (mac, vni) not in self.gpe_map['remote_map']:
-            is_ip4 = 1 if ip_network(unicode(remote_ip)).version == 4 else 0
-            remote_locator = {"is_ip4": is_ip4,
-                              "priority": 1,
-                              "weight": 1,
-                              "addr": self._pack_address(remote_ip)
-                              }
-            self.vpp.add_lisp_remote_mac(mac, vni, remote_locator)
-            self.gpe_map['remote_map'][(mac, vni)] = remote_ip
-
-    def delete_remote_gpe_mapping(self, vni, mac):
-        """Delete a remote GPE vni to mac mapping."""
-        if (mac, vni) in self.gpe_map['remote_map']:
-            self.vpp.del_lisp_remote_mac(mac, vni)
-            del self.gpe_map['remote_map'][(mac, vni)]
-
-    def add_local_gpe_mapping(self, vni, mac):
-        """Add a local GPE mapping between a mac and vni."""
-        lset_mapping = self.gpe_map[gpe_lset_name]
-        LOG.debug('Adding vni %s to gpe_map', vni)
-        lset_mapping['vnis'].add(vni)
-        if mac not in lset_mapping['local_map']:
-            self.vpp.add_lisp_local_mac(mac, vni, gpe_lset_name)
-            lset_mapping['local_map'][mac] = vni
-
-    def delete_local_gpe_mapping(self, vni, mac):
-        lset_mapping = self.gpe_map[gpe_lset_name]
-        if mac in lset_mapping['local_map']:
-            self.vpp.del_lisp_local_mac(mac, vni, gpe_lset_name)
-            del self.gpe_map[gpe_lset_name]['local_map'][mac]
-
-    def clear_remote_gpe_mappings(self, segmentation_id):
-        """Clear all GPE mac to seg_id remote mappings for the seg_id.
-
-        When a segment is unbound from a host, all remote GPE mappings for
-        that segment are cleared.
-        """
-        LOG.debug("Clearing all gpe remote mappings for VNI:%s",
-                  segmentation_id)
-        for mac_vni_tpl in self.gpe_map['remote_map'].keys():
-            mac, vni = mac_vni_tpl
-            if segmentation_id == vni:
-                self.delete_remote_gpe_mapping(vni, mac)
-
-    def ensure_gpe_link(self):
-        """Ensures that the GPE uplink interface is present and configured.
-
-        Returns:-
-        The software_if_index of the GPE uplink functioning as the underlay
-        """
-        intf, if_physnet = self.get_if_for_physnet(self.gpe_locators)
-        LOG.debug('Setting vxlan gpe underlay attachment interface: %s',
-                  intf)
-        if if_physnet is None:
-            LOG.error('Cannot create a vxlan GPE network because the gpe_'
-                      'locators config value:%s is broken. Make sure this '
-                      'value is set to a valid physnet name used as the '
-                      'GPE underlay interface',
-                      self.gpe_locators)
-            sys.exit(1)
-        self.vpp.ifup(if_physnet)
-        # Set the underlay IP address using the gpe_src_cidr config option
-        # setting in the config file
-        LOG.debug('Configuring GPE underlay ip address %s on '
-                  'interface %s', self.gpe_src_cidr, intf)
-        (self.gpe_underlay_addr,
-         self.gpe_underlay_mask) = self.gpe_src_cidr.split('/')
-        self.vpp.set_interface_address(
-            sw_if_index=if_physnet,
-            is_ipv6=1 if ip_network(unicode(self.gpe_underlay_addr)
-                                    ).version == 6 else 0,
-            address_length=int(self.gpe_underlay_mask),
-            address=self._pack_address(self.gpe_underlay_addr)
-            )
-        return (intf, if_physnet)
-
-    def ensure_gpe_underlay(self):
-        """Ensures that the GPE locator and locator sets are present in VPP
-
-        A locator interface in GPE functions as the underlay attachment point
-        This method will ensure that the underlay is programmed correctly for
-        GPE to function properly
-
-        Returns :- A list of locator sets
-        [{'locator_set_name': <ls_set_name>,
-         'locator_set_index': <ls_index>,
-         'sw_if_idxs': []
-        }]
-        """
-        # Check if any exsiting GPE underlay (a.k.a locator) is present in VPP
-        # Read existing loctor-sets and locators in VPP by name
-        locators = self.vpp.get_lisp_local_locators(gpe_lset_name)
-        # Create a new GPE locator set if the locator does not exist
-        if not locators:
-            LOG.debug('Creating GPE locator set %s', gpe_lset_name)
-            self.vpp.add_lisp_locator_set(gpe_lset_name)
-        _, if_physnet = self.ensure_gpe_link()
-        # Add the underlay interface to the locator set
-        LOG.debug('Adding GPE locator for interface %s to locator-'
-                  'set %s', if_physnet, gpe_lset_name)
-        # Remove any stale locators from the locator set, which may
-        # be due to a configuration change
-        locator_indices = locators[0]['sw_if_idxs'] if locators else []
-        for sw_if_index in locator_indices:
-            if sw_if_index != if_physnet:
-                self.vpp.del_lisp_locator(
-                    locator_set_name=gpe_lset_name,
-                    sw_if_index=sw_if_index)
-        # Add the locator interface to the locator set if not present
-        if not locators or if_physnet not in locator_indices:
-            self.vpp.add_lisp_locator(
-                locator_set_name=gpe_lset_name,
-                sw_if_index=if_physnet
-                )
-        return self.vpp.get_lisp_local_locators(gpe_lset_name)
-
-    def load_gpe_mappings(self):
-        """Construct GPE locator mapping data structure in the VPP Forwarder.
-
-        Read the locator and EID table mapping data from VPP and construct
-        a gpe mapping for all existing local and remote end-point identifiers
-
-        gpe_map: {'<locator_set_name>': {'locator_set_index': <index>,
-                                              'sw_if_idxs' : set([<index>]),
-                                              'vnis' : set([<vni>]),
-                                              'local_map' : {<mac>: <vni>},
-                        'remote_map' :  {<(mac, vni)> : <remote_ip>}
-                       }
-        """
-        # First enable lisp
-        LOG.debug("Enabling LISP GPE within VPP")
-        self.vpp.lisp_enable()
-        LOG.debug("Querying VPP to create a LISP GPE lookup map")
-        # Ensure that GPE underlay locators are present and configured
-        locators = self.ensure_gpe_underlay()
-        LOG.debug('GPE locators %s for locator set %s',
-                  locators, gpe_lset_name)
-        # [ {'is_local':<>, 'locator_set_index':<>, 'mac':<>, 'vni':<>},.. ]
-        # Load any existing MAC to VNI mappings
-        eids = self.vpp.get_lisp_eid_table()
-        LOG.debug('GPE eid table %s', eids)
-        # Construct the GPE map from existing locators and mappings within VPP
-        for locator in locators:
-            data = {'locator_set_index': locator['locator_set_index'],
-                    'sw_if_idxs': set(locator['sw_if_idxs']),
-                    'vnis': set([val['vni'] for val in eids if
-                                val['locator_set_index'] == locator[
-                                    'locator_set_index']]),
-                    'local_map': {val['mac']: val['vni'] for val
-                                  in eids if val['is_local'] and
-                                  val['locator_set_index'] == locator[
-                                      'locator_set_index']}
-                    }
-            self.gpe_map[locator['locator_set_name']] = data
-        # Create the remote GPE: mac-address to underlay lookup mapping
-        self.gpe_map['remote_map'] = {
-            (val['mac'], val['vni']): self.vpp.get_lisp_locator_ip(val[
-                'locator_set_index']) for val in eids if not val['is_local']
-            }
-        LOG.debug('Successfully created a GPE lookup map by querying vpp %s',
-                  self.gpe_map)
-
-######################################################################
-
-LEADIN = '/networking-vpp'  # TODO(ijw): make configurable?
-ROUTER_DIR = 'routers/router/'
-ROUTER_INTF_DIR = 'routers/interface/'
-ROUTER_FIP_DIR = 'routers/floatingip/'
+# TrunkWatcher thread's heartbeat interval
+# TODO(onong): make it configurable if need be
+TRUNK_WATCHER_HEARTBEAT = 30
 
 
 class EtcdListener(object):
@@ -2017,22 +2522,46 @@ class EtcdListener(object):
         self.pool = eventlet.GreenPool()
         self.secgroup_enabled = cfg.CONF.SECURITYGROUP.enable_security_group
 
+        # Add GPE key-watching, if required
+        if TYPE_GPE in cfg.CONF.ml2.type_drivers:
+            self.gpe_listener = gpe.GpeListener(self)
+        else:
+            self.gpe_listener = None
+
         # These data structures are used as readiness indicators.
         # A port is only in here only if the attachment part of binding
         # has completed.
-        # key: if index in VPP; value: (ID, bound-callback, vpp-prop-dict)
+        # key: ifidx of port; value: (UUID, bound-callback, vpp-prop-dict)
         self.iface_state = {}
+        # key: UUID of port; value: ifidx
+        self.iface_state_ifidx = {}
 
         # Members of this are ports requiring security groups with unsatisfied
         # requirements.
         self.iface_awaiting_secgroups = {}
-
+        # Sub-ports of a trunk with pending port bindings.
+        # trunk_port ID => List(sub_ports awaiting binding)
+        # When the agent is restarted, it could receive an etcd watch event
+        # to bind subports even before the parent port itself is bound. This
+        # dict keeps tracks of such sub_ports. They will be reconsidered
+        # for binding after the parent is bound.
+        self.subports_awaiting_parents = {}
+        # bound subports of parent ports
+        # trunk_port ID => set(bound subports)
+        self.bound_subports = defaultdict(set)
         # We also need to know if the vhostuser interface has seen a socket
         # connection: this tells us there's a state change, and there is
         # a state detection function on self.vppf.
         self.vppf.vhost_ready_callback = self._vhost_ready
 
     def unbind(self, id):
+        if id not in self.iface_state_ifidx:
+            # Unbinding an unknown port
+            return
+
+        if self.iface_state_ifidx[id] in self.iface_state:
+            del self.iface_state[self.iface_state_ifidx[id]]
+        del self.iface_state_ifidx[id]
         self.vppf.unbind_interface_on_host(id)
 
     def bind(self, bound_callback, id, binding_type, mac_address, physnet,
@@ -2051,17 +2580,17 @@ class EtcdListener(object):
         includes the behaviour of whatever's on the other end of the
         interface.
         """
-        # args['binding_type'] in ('vhostuser', 'plugtap'):
+        # args['binding_type'] in ('vhostuser', 'tap'):
         # For GPE, fetch remote mappings from etcd for any "new" network
         # segments we will be binding to so we are aware of all the remote
         # overlay (mac) to underlay (IP) values
-        if network_type == 'vxlan':
-            # For vxlan-gpe, a physnet value is not messaged by ML2 as it
+        if network_type == TYPE_GPE and self.gpe_listener is not None:
+            # For GPE, a physnet value is not messaged by ML2 as it
             # is not specified for creating a gpe tenant network. Hence for
             # these net types we replace the physnet with the value of
             # gpe_locators, which stand for the physnet name.
-            physnet = self.vppf.gpe_locators
-            self.ensure_gpe_remote_mappings(segmentation_id)
+            physnet = self.gpe_listener.physnet()
+            self.gpe_listener.ensure_gpe_remote_mappings(segmentation_id)
         props = self.vppf.bind_interface_on_host(binding_type,
                                                  id,
                                                  mac_address,
@@ -2086,11 +2615,13 @@ class EtcdListener(object):
             self.iface_awaiting_secgroups[iface_idx] = \
                 security_data.get('security_groups', [])
         else:
-            self.iface_awaiting_secgroups[iface_idx] = []
+            # 'None' is a special value indicating no port security
+            self.iface_awaiting_secgroups[iface_idx] = None
 
         self.iface_state[iface_idx] = (id, bound_callback, props)
+        self.iface_state_ifidx[id] = iface_idx
 
-        self.apply_spoof_macip(iface_idx, security_data)
+        self.apply_spoof_macip(iface_idx, security_data, props)
 
         self.maybe_apply_secgroups(iface_idx)
 
@@ -2116,7 +2647,7 @@ class EtcdListener(object):
 
         return self.vppf.find_bound_ports()
 
-    def apply_spoof_macip(self, iface_idx, security_data):
+    def apply_spoof_macip(self, iface_idx, security_data, props):
         """Apply non-secgroup security to a port
 
         This is an idempotent function to set up the port security
@@ -2124,8 +2655,6 @@ class EtcdListener(object):
         solely from the data on the port itself.
 
         """
-
-        (id, bound_callback, props) = self.iface_state[iface_idx]
 
         # TODO(ijw): this is a convenience for spotting L3 and DHCP
         # ports, but it's not the right way
@@ -2187,13 +2716,17 @@ class EtcdListener(object):
 
         # TODO(ijw): this is a convenience for spotting L3 and DHCP
         # ports, but it's not the right way
+        # (TODO(ijw) it's also the only reason we go to iface_state)
         is_secured_port = props['bind_type'] == 'vhostuser'
 
         # If security-groups are enabled and it's a port needing
-        # security proceed to set L3/L2 ACLs, else skip security
+        # security proceed to set L3/L2 ACLs, else skip security.
+        # If security-groups are empty, apply the default spoof-acls.
+        # This is the correct behavior when security-groups are enabled but
+        # not set on a port.
         if (self.secgroup_enabled and
-                is_secured_port and
-                secgroup_ids != []):
+                secgroup_ids is not None and  # port security off
+                is_secured_port):
             if not self.vppf.maybe_set_acls_on_port(
                     secgroup_ids,
                     iface_idx):
@@ -2205,15 +2738,21 @@ class EtcdListener(object):
             LOG.debug("Clearing port_security on "
                       "port %s", id)
             self.vppf.remove_acls_on_port(
-                props['iface_idx'])
+                iface_idx)
 
         # Remove with no error if not present
         self.iface_awaiting_secgroups.pop(iface_idx, None)
 
         self.maybe_up(iface_idx)
 
-    def _vhost_ready(self, sw_if_index):
-            self.maybe_up(sw_if_index)
+    def _vhost_ready(self, id):
+        # The callback from VPP only knows the IP; convert
+        # .. and note that we may not know the conversion
+        iface_idx = self.iface_state_ifidx.get(id)
+        if iface_idx is None:
+            # Not a port we know about
+            return
+        self.maybe_up(iface_idx)
 
     def maybe_up(self, iface_idx):
         """Flag that an interface is connected, if it is
@@ -2238,7 +2777,7 @@ class EtcdListener(object):
         (id, bound_callback, props) = self.iface_state[iface_idx]
 
         if (props['bind_type'] == 'vhostuser' and
-                not self.vppf.vhostuser_linked_up(iface_idx)):
+                not self.vppf.vhostuser_linked_up(id)):
             # vhostuser connection that hasn't yet found a friend
             return
 
@@ -2259,16 +2798,56 @@ class EtcdListener(object):
         """
 
         def _secgroup_rule(r):
-            ip_addr = unicode(r['remote_ip_addr'])
+            # Create a rule for the remote_ip_prefix (CIDR) value
+            if r['remote_ip_addr']:
+                remote_ip_prefixes = [(six.text_type(r['remote_ip_addr']),
+                                       r['ip_prefix_len'])]
+            # Create a rule for each ip address in the remote_group
+            else:
+                remote_group = r['remote_group_id']
+                prefix_length = 128 if r['is_ipv6'] else 32
+                ip_version = 6 if r['is_ipv6'] else 4
+                # Add the referencing secgroup ID to the remote-group lookup
+                # data set. This enables the RemoteGroupWatcher thread to
+                # lookup the secgroups that need to be updated for a
+                # remote-group etcd watch event
+                self.vppf.remote_group_secgroups[remote_group].add(secgroup)
+                remote_ip_prefixes = [
+                    (six.text_type(ip), prefix_length) for port in
+                    self.vppf.remote_group_ports[remote_group]
+                    for ip in self.vppf.port_ips[port]
+                    if ipnet(ip).version == ip_version]
+                LOG.debug("remote_group: vppf.remote_group_ports:%s",
+                          self.vppf.remote_group_ports
+                          )
+                LOG.debug("remote_group: vppf.port_ips:%s",
+                          self.vppf.port_ips)
+                LOG.debug("remote_group_ip_prefixes:%s for group %s",
+                          remote_ip_prefixes, remote_group)
+                LOG.debug("remote_group_secgroups: %s",
+                          self.vppf.remote_group_secgroups)
             # VPP API requires the IP addresses to be represented in binary
-            return SecurityGroupRule(r['is_ipv6'],
-                                     ip_address(ip_addr).packed,
-                                     r['ip_prefix_len'], r['protocol'],
-                                     r['port_min'], r['port_max'])
+            rules = [SecurityGroupRule(r['is_ipv6'],
+                                       ipaddr(ip_addr).packed,
+                                       ip_prefix_len,
+                                       r.get('remote_group_id', None),
+                                       r['protocol'],
+                                       r['port_min'],
+                                       r['port_max'])
+                     for ip_addr, ip_prefix_len in remote_ip_prefixes]
+            return rules
+
         ingress_rules, egress_rules = (
             [_secgroup_rule(r) for r in data['ingress_rules']],
             [_secgroup_rule(r) for r in data['egress_rules']]
             )
+        # Flatten ingress and egress rules
+        ingress_rules, egress_rules = (
+            [rule for rule_list in ingress_rules for rule in rule_list],
+            [rule for rule_list in egress_rules for rule in rule_list]
+            )
+        LOG.debug("remote_group: sec_group: %s, ingress rules: %s "
+                  "egress_rules: %s", secgroup, ingress_rules, egress_rules)
         self.vppf.acl_add_replace_on_host(SecurityGroup(secgroup,
                                                         ingress_rules,
                                                         egress_rules))
@@ -2336,55 +2915,134 @@ class EtcdListener(object):
         except AttributeError:
             pass   # cannot reference acl attribute - pass and exit
 
-# #################### LISP GPE Methods ###############################
-    def is_valid_remote_map(self, vni, host):
-        """Return True if the remote map is valid else False.
+    def update_remote_group_secgroups(self, remote_group):
+        """Update the ACLs of all security groups that use a remote-group.
 
-        A remote mapping is valid only if we bind a port on the vni
-        Ignore all the other remote mappings as the host doesn't care
+        When a remote_group to port association is changed,
+        i.e. A new port is associated with (or) an existing port is removed,
+        the agent needs to update the VPP ACLs belonging to all the
+        security groups that use this remote-group in their rules.
+
+        Since this is called from various threads it makes a new etcd
+        client each call.
         """
-        if host != self.host and vni in self.vppf.gpe_map[gpe_lset_name][
-            'vnis']:
-            return True
-        else:
-            return False
+        secgroups = self.vppf.remote_group_secgroups[remote_group]
+        LOG.debug("Updating secgroups:%s referencing the remote_group:%s",
+                  secgroups, remote_group)
+        etcd_client = self.client_factory.client()
+        etcd_writer = etcdutils.json_writer(etcd_client)
 
-    def fetch_remote_gpe_mappings(self, vni):
-        """Fetch and add all remote mappings from etcd for the vni"""
-        key_space = self.gpe_key_space + "/%s" % vni
-        LOG.debug("Fetching remote gpe mappings for vni:%s", vni)
-        rv = self.client_factory.client().read(key_space, recursive=True)
-        for child in rv.children:
-            m = re.match(key_space + '/([^/]+)' + '/([^/]+)', child.key)
-            if m:
-                hostname = m.group(1)
-                mac = m.group(2)
-                if self.is_valid_remote_map(vni, hostname):
-                    self.vppf.ensure_remote_gpe_mapping(vni, mac, child.value)
+        for secgroup in secgroups:
+            secgroup_key = self.secgroup_key_space + "/%s" % secgroup
+            # TODO(najoy):Update to the new per thread etcd-client model
 
-    def ensure_gpe_remote_mappings(self, segmentation_id):
-        """Ensure all the remote GPE mappings are present in VPP
+            # TODO(ijw): all keys really present?
+            data = etcd_writer.read(secgroup_key).value
 
-        Ensures the following:
-        1) The bridge domain exists for the segmentation_id
-        2) A segmentation_id to bridge-domain mapping is present
-        3) All remote overlay to underlay mappings are fetched from etcd and
-        added corresponding to this segmentation_id
+            LOG.debug("Updating remote_group rules %s for secgroup %s",
+                      data, secgroup)
+            self.acl_add_replace(secgroup, data)
 
-        Arguments:-
-        segmentation_id :- The VNI for which all remote overlay (MAC) to
-        underlay mappings are fetched from etcd and ensured in VPP
+    # EtcdListener Trunking section
+    def reconsider_trunk_subports(self):
+        """Try to bind subports awaiting their parent port to be bound.
+
+        If the parent port
+            - is bound
+            - instance has connected to the other end of the vhostuser
+            - security groups has been applied
+            - is in admin UP state
+        then:
+            - bind the subports, and
+            - set subport state to admin UP
         """
-        lset_data = self.vppf.gpe_map[gpe_lset_name]
-        # Fetch and add remote mappings only for "new" segments that we do
-        # not yet know of, but will be binding to shortly as requested by ML2
-        if segmentation_id not in lset_data['vnis']:
-            lset_data['vnis'].add(segmentation_id)
-            bridge_idx = self.vppf.bridge_idx_for_lisp_segment(segmentation_id)
-            self.vppf.ensure_bridge_domain_in_vpp(bridge_idx)
-            self.vppf.ensure_gpe_vni_to_bridge_mapping(segmentation_id,
-                                                       bridge_idx)
-            self.fetch_remote_gpe_mappings(segmentation_id)
+        for parent_port, subports in self.subports_awaiting_parents.items():
+            LOG.debug('reconsidering bind for trunk subports %s, parent %s',
+                      subports, parent_port)
+            props = self.vppf.interfaces.get(parent_port, None)
+            # Make sure parent port is really ready
+            if (props and props['iface_idx'] in self.iface_state and
+                    self.vppf.vhostuser_linked_up(parent_port) and
+                    props['iface_idx'] not in self.iface_awaiting_secgroups):
+                LOG.debug("Parent trunk port vhostuser ifidx %s is ready",
+                          props['iface_idx'])
+                self.bind_unbind_subports(parent_port, subports)
+                self.subports_awaiting_parents.pop(parent_port)
+            else:
+                LOG.debug("Parent trunk port is not ready")
+
+    def subports_to_unbind(self, parent_port, subports):
+        """Return a list of subports to unbind for a parent port.
+
+        subports :- A set of subports that need to be currently bound
+        to the parent port.
+        """
+        # unbind 'bound sub-ports' that are not in the current subports
+        return self.bound_subports[parent_port] - subports
+
+    def subports_to_bind(self, parent_port, subports):
+        """Return a list of subports to unbind for a parent port.
+
+        subports :- A set of subports that need to be currently bound
+        to the parent port.
+        """
+        # remove ports from subports that are already bound and only bind the
+        # new ports.
+        return subports - self.bound_subports[parent_port]
+
+    def bind_unbind_subports(self, parent_port, subports):
+        """Bind or unbind the subports of the parent ports as needed.
+
+        To unbind all bound subports of a parent port, provide the
+        parent_port argument with subports set to an empty list.
+        Sample subports data structure: List of dicts
+
+        [{"segmentation_id": 11,
+         "uplink_seg_id": 149,
+         "segmentation_type": "vlan",
+         "uplink_seg_type": "vlan",
+         "port_id": "9ee91c37-9150-49ff-9ea7-48e98547771a",
+         "physnet": "physnet1"},
+
+         {"segmentation_id": 12,
+          "uplink_seg_id": 139,
+          "segmentation_type": "vlan",
+          "uplink_seg_type": "vlan",
+          "port_id": "2b1a89ba-78f1-4350-b71a-7caf7f23cbcf",
+          "physnet": "physnet1"}]
+
+        """
+        LOG.debug('Binding or Unbinding subports %s of parent trunk port %s',
+                  subports, parent_port)
+        subport_set = set([p['port_id'] for p in subports])
+        subports_to_bind = self.subports_to_bind(parent_port, subport_set)
+        LOG.debug('Binding subports %s of a parent trunk port %s',
+                  subports_to_bind, parent_port)
+        subports_to_unbind = self.subports_to_unbind(parent_port,
+                                                     subport_set)
+        LOG.debug('Unbinding subports %s of a parent trunk port %s',
+                  subports_to_unbind, parent_port)
+        # bind subports we are told to bind
+        for subport in subports_to_bind:
+            subport_data = [p for p in subports
+                            if p['port_id'] == subport][0]
+            LOG.debug('Binding subport %s of parent trunk port %s '
+                      'sub_port_data %s',
+                      subport, parent_port, subport_data)
+            props = self.vppf.bind_subport_on_host(parent_port, subport_data)
+            # Bring up the subport
+            if props:
+                self.bound_subports[parent_port].add(subport)
+                subport_iface_idx = props['iface_idx']
+                LOG.debug("Bringing up the trunk subport vhost ifidx %s",
+                          subport_iface_idx)
+                self.vppf.ifup(subport_iface_idx)
+        # unbind subports we are told to unbind
+        for subport in subports_to_unbind:
+            LOG.debug('Unbinding subport %s of parent_port %s',
+                      subport, parent_port)
+            self.vppf.unbind_subport_on_host(subport)
+            self.bound_subports[parent_port].remove(subport)
 
     AGENT_HEARTBEAT = 60  # seconds
 
@@ -2398,7 +3056,8 @@ class EtcdListener(object):
         self.secgroup_key_space = LEADIN + "/global/secgroups"
         self.state_key_space = LEADIN + "/state/%s/ports" % self.host
         self.physnet_key_space = LEADIN + "/state/%s/physnets" % self.host
-        self.gpe_key_space = LEADIN + "/global/networks/gpe"
+        self.remote_group_key_space = LEADIN + "/global/remote_group"
+        self.trunk_key_space = LEADIN + "/nodes/%s/trunks" % self.host
 
         etcd_client = self.client_factory.client()
         etcd_helper = etcdutils.EtcdHelper(etcd_client)
@@ -2409,10 +3068,13 @@ class EtcdListener(object):
         etcd_helper.ensure_dir(self.state_key_space)
         etcd_helper.ensure_dir(self.physnet_key_space)
         etcd_helper.ensure_dir(self.router_key_space)
-        etcd_helper.ensure_dir(self.gpe_key_space)
+        etcd_helper.ensure_dir(self.remote_group_key_space)
+        etcd_helper.ensure_dir(self.trunk_key_space)
 
         etcd_helper.clear_state(self.state_key_space)
 
+        # py3 note: in py3 keys() does not return a list but the following
+        # seems to work fine. Enclose in list() is problems arise.
         physnets = self.physnets.keys()
         etcd_helper.clear_state(self.physnet_key_space)
         for f in physnets:
@@ -2425,20 +3087,9 @@ class EtcdListener(object):
 
         # load sw_if_index to macip acl index mappings
         self.load_macip_acl_mapping()
-        if 'vxlan' in cfg.CONF.ml2.type_drivers:
-            self.vppf.load_gpe_mappings()
 
         self.binder = BindNotifier(self.client_factory, self.state_key_space)
         self.pool.spawn(self.binder.run)
-
-        # Check if the vpp router service plugin is enabled
-        if 'vpp-router' in cfg.CONF.service_plugins:
-            LOG.debug("Spawning router_watcher")
-            self.pool.spawn(RouterWatcher(self.client_factory.client(),
-                                          'router_watcher',
-                                          self.router_key_space,
-                                          heartbeat=self.AGENT_HEARTBEAT,
-                                          data=self).watch_forever)
 
         if self.secgroup_enabled:
             LOG.debug("loading VppAcl map from acl tags for "
@@ -2454,6 +3105,11 @@ class EtcdListener(object):
                                             known_secgroup_ids,
                                             heartbeat=self.AGENT_HEARTBEAT,
                                             data=self).watch_forever)
+            self.pool.spawn(RemoteGroupWatcher(self.client_factory.client(),
+                                               'remote_group_watcher',
+                                               self.remote_group_key_space,
+                                               heartbeat=self.AGENT_HEARTBEAT,
+                                               data=self).watch_forever)
 
         # The security group watcher will load the secgroups before
         # this point (before the thread is spawned) - that's helpful,
@@ -2465,27 +3121,51 @@ class EtcdListener(object):
                                     self.port_key_space,
                                     heartbeat=self.AGENT_HEARTBEAT,
                                     data=self).watch_forever)
-        # Spawn GPE watcher for vxlan tenant networks
-        if 'vxlan' in cfg.CONF.ml2.type_drivers:
-            LOG.debug("Spawning gpe_watcher")
-            self.pool.spawn(GpeWatcher(self.client_factory.client(),
-                                       'gpe_watcher',
-                                       self.gpe_key_space,
-                                       heartbeat=self.AGENT_HEARTBEAT,
-                                       data=self).watch_forever)
+
+        # Spawn trunk watcher if enabled
+        if 'vpp-trunk' in cfg.CONF.service_plugins:
+            LOG.debug("Spawning trunk_watcher")
+            self.pool.spawn(TrunkWatcher(self.client_factory.client(),
+                                         'trunk_watcher',
+                                         self.trunk_key_space,
+                                         heartbeat=TRUNK_WATCHER_HEARTBEAT,
+                                         data=self).watch_forever)
+
+        # Spawn GPE watcher for GPE tenant networks
+        if self.gpe_listener is not None:
+            self.gpe_listener.spawn_watchers(self.pool,
+                                             self.AGENT_HEARTBEAT,
+                                             self)
+
+        # Spawning after the port bindings are done so that
+        # the RouterWatcher doesn't do unnecessary work
+        if 'vpp-router' in cfg.CONF.service_plugins:
+            if cfg.CONF.ml2_vpp.enable_l3_ha:
+                LOG.info("L3 HA is enabled")
+            LOG.debug("Spawning router_watcher")
+            self.pool.spawn(RouterWatcher(self.client_factory.client(),
+                                          'router_watcher',
+                                          self.router_key_space,
+                                          heartbeat=self.AGENT_HEARTBEAT,
+                                          data=self).watch_forever)
+
         self.pool.waitall()
 
 
 class PortWatcher(etcdutils.EtcdChangeWatcher):
 
-    def do_tick(self):
-        # The key that indicates to people that we're alive
-        # (not that they care)
-        # TODO(ijw): use refresh after the create to avoid the
-        # notification
+    def __init__(self, *args, **kwargs):
+        super(PortWatcher, self).__init__(*args, **kwargs)
         self.etcd_client.write(LEADIN + '/state/%s/alive' %
                                self.data.host,
                                1, ttl=3 * self.heartbeat)
+
+    def do_tick(self):
+        # The key that indicates to people that we're alive
+        # (not that they care)
+        self.etcd_client.refresh(LEADIN + '/state/%s/alive' %
+                                 self.data.host,
+                                 ttl=3 * self.heartbeat)
 
     def init_resync_start(self):
         """Identify known ports in VPP
@@ -2504,20 +3184,20 @@ class PortWatcher(etcdutils.EtcdChangeWatcher):
         # Removing key == desire to unbind
 
         try:
-            is_vxlan = False
             port_data = self.data.vppf.interfaces[port]
             port_net = port_data['net_data']
-            is_vxlan = port_net['network_type'] == 'vxlan'
+            is_gpe = port_net['network_type'] == TYPE_GPE \
+                and self.data.gpe_listener is not None
 
-            if is_vxlan:
+            if is_gpe:
                 # Get seg_id and mac to delete any gpe mappings
                 seg_id = port_net['segmentation_id']
                 mac = port_data['mac']
         except KeyError:
             # On initial resync, this information may not
             # be available; also, the network may not
-            # be vxlan
-            if is_vxlan:
+            # be gpe
+            if is_gpe:
                 LOG.warning('Unable to delete GPE mappings for port')
 
         self.data.unbind(port)
@@ -2528,10 +3208,9 @@ class PortWatcher(etcdutils.EtcdChangeWatcher):
             self.etcd_client.delete(
                 self.data.state_key_space + '/%s'
                 % port)
-            if is_vxlan:
-                self.etcd_client.delete(
-                    self.data.gpe_key_space + '/%s/%s/%s'
-                    % (seg_id, self.data.host, mac))
+            if is_gpe:
+                self.data.gpe_listener.delete_etcd_gpe_remote_mapping(
+                    seg_id, mac)
         except etcd.EtcdKeyNotFound:
             # Gone is fine; if we didn't delete it
             # it's no problem
@@ -2547,11 +3226,19 @@ class PortWatcher(etcdutils.EtcdChangeWatcher):
         # an update.
 
         data = jsonutils.loads(value)
+
+        # For backward comatibility reasons, 'plugtap' now means 'tap'
+        # Post-17.07 'tap' is used, but this allows compatibility with
+        # previously stored information in etcd.
+        binding_type = data['binding_type']
+        if binding_type == 'plugtap':
+            binding_type = 'tap'
+
         self.data.bind(
             self.data.binder.add_notification,
             port,
-            data['binding_type'],
-            data['mac_address'],
+            binding_type,
+            None,  # We will set this closer to the actual vpp call
             data['physnet'],
             data['network_type'],
             data['segmentation_id'],
@@ -2561,20 +3248,18 @@ class PortWatcher(etcdutils.EtcdChangeWatcher):
         # we have nothing we can do at this point.  We simply
         # decline to notify Nova the port is ready.
 
-        # For vxlan networks,
+        # For GPE networks,
         # write the remote mapping data to etcd to
-        # propagate the mac to underlay mapping to all
+        # propagate both the mac to underlay mapping and
+        # mac to instance's IP (for ARP) mapping to all
         # agents that bind this segment using GPE
-        if data['network_type'] == 'vxlan':
-            host_ip = self.data.vppf.gpe_underlay_addr
-            gpe_key = self.data.gpe_key_space + '/%s/%s/%s' % (
-                data['segmentation_id'],
-                self.data.host,
-                data['mac_address'])
-            LOG.debug('Writing gpe key %s with vxlan mapping '
-                      'to underlay IP address %s',
-                      gpe_key, host_ip)
-            self.etcd_client.write(gpe_key, host_ip)
+        if data['network_type'] == TYPE_GPE \
+                and self.data.gpe_listener is not None:
+            props = self.data.vppf.interfaces[port]
+            mac = props['mac']
+            for ip in [ip['ip_address'] for ip in data.get('fixed_ips')]:
+                self.data.gpe_listener.add_etcd_gpe_remote_mapping(
+                    data['segmentation_id'], mac, ip)
 
 
 class RouterWatcher(etcdutils.EtcdChangeWatcher):
@@ -2584,62 +3269,106 @@ class RouterWatcher(etcdutils.EtcdChangeWatcher):
     this node. This watcher is responsible for consuming
     Neutron router CRUD operations.
     """
+
+    # TODO(ijw): consider how to remove GPE references from the router
+    # code, as they *should* be dealt with by port binding functions.
+
     def do_tick(self):
         pass
 
-    def _del_key(self, key):
-        try:
-            self.etcd_client.delete(key)
-        except etcd.EtcdKeyNotFound:
-            # Gone is fine; if we didn't delete it
-            # it's no problem
-            pass
+    def parse_key(self, router_key):
+        """Parse the key into two tokens and return a tuple.
 
-    def key_change(self, action, key, value):
-        LOG.debug("router_watcher: doing work for %s %s %s" %
-                  (action, key, value))
-        m = re.match(self.data.router_key_space + '/([^/]+)/([^/]+)?$',
-                     key)
-        if m and m.group(1) == 'interface':
-            if action != 'delete':
-                router_id = m.group(2)
-                router = jsonutils.loads(value)
-                if router.get('delete', False):
-                    self.data.vppf.delete_router_interface_on_host(
-                        router)
-                    self._del_key(self.data.router_key_space +
-                                  '/interface/%s' % router_id)
-                else:
-                    self.data.vppf.create_router_interface_on_host(
-                        router)
-        elif m and m.group(1) == 'floatingip':
-            if action != 'delete':
-                floatingip_dict = jsonutils.loads(value)
-                if floatingip_dict['event'] == 'associate':
-                    self.data.vppf.associate_floatingip(
-                        floatingip_dict)
-                else:
-                    self.data.vppf.disassociate_floatingip(
-                        floatingip_dict)
-                    self._del_key(self.data.router_key_space +
-                                  '/floatingip/%s' % m.group(2))
-        elif m and m.group(1) == 'router':
-            if action != 'delete':
-                router_id = m.group(2)
-                router = jsonutils.loads(value)
-                if router.get('delete', False):
-                    # Delete an external gateway
-                    (self.data.vppf.
-                     delete_router_external_gateway_on_host(router))
-                    self._del_key(self.data.router_key_space +
-                                  '/router/%s' % router_id)
-                else:
-                    # Add the external gateway
-                    (self.data.vppf.
-                     create_router_external_gateway_on_host(router))
+        The returned tuple is denoted by (token1, token2).
+        If token1 == "floatingip", then token2 is the ID of the
+        floatingip that is added or removed on the server.
+        If, token1 == router_ID and token2 == port_ID of the router
+        interface that is added or removed.
+        If, token1 == 'ha', then we return that token for router watcher
+        to action.
+        """
+        m = re.match('([^/]+)' + '/([^/]+)', router_key)
+        floating_ip, router_id, port_id = None, None, None
+        if m and m.group(1) and m.group(2):
+            if m.group(1) == 'floatingip':
+                floating_ip = m.group(2)
+                return ('floatingip', floating_ip)
+            else:
+                router_id = m.group(1)
+                port_id = m.group(2)
+                return (router_id, port_id)
         else:
-            LOG.warning('Unexpected key change in etcd router feedback,'
-                        ' key %s', key)
+            return (None, None)
+
+    def add_remove_gpe_mappings(self, port_id, router_data, is_add=1):
+        """Add a GPE mapping to the router's loopback mac-address."""
+        if router_data.get('external_gateway_info', False):
+            loopback_mac = self.data.vppf.router_external_interfaces[
+                port_id]['mac_address']
+        else:
+            loopback_mac = self.data.vppf.router_interfaces[
+                port_id]['mac_address']
+        # GPE remote mappings are added for only the master L3 router,
+        # if ha_enabled
+        ha_enabled = cfg.CONF.ml2_vpp.enable_l3_ha
+        if is_add:
+            if (ha_enabled and self.data.vppf.router_state) or not ha_enabled:
+                self.data.gpe_listener.add_etcd_gpe_remote_mapping(
+                    router_data['segmentation_id'],
+                    loopback_mac,
+                    router_data['gateway_ip'])
+        else:
+            self.data.gpe_listener.delete_etcd_gpe_remote_mapping(
+                router_data['segmentation_id'],
+                loopback_mac)
+
+    def added(self, router_key, value):
+        token1, token2 = self.parse_key(router_key)
+        if token1 and token2:
+            if token1 != 'floatingip':
+                port_id = token2
+                router_data = jsonutils.loads(value)
+                self.data.vppf.ensure_router_interface_on_host(
+                    port_id, router_data)
+                self.data.vppf.maybe_associate_floating_ips()
+                if router_data.get('net_type') == TYPE_GPE:
+                    self.add_remove_gpe_mappings(port_id, router_data,
+                                                 is_add=1)
+            else:
+                floating_ip = token2
+                floatingip_dict = jsonutils.loads(value)
+                self.data.vppf.associate_floatingip(floating_ip,
+                                                    floatingip_dict)
+        if cfg.CONF.ml2_vpp.enable_l3_ha and router_key == 'ha':
+            LOG.debug('Setting VPP-Router HA State..')
+            router_state = bool(jsonutils.loads(value))
+            LOG.debug('Router state is: %s', router_state)
+            # Become master if a state is True, else become backup
+            state = 'MASTER' if router_state else 'BACKUP'
+            LOG.debug('VPP Router HA state has become: %s', state)
+            self.data.vppf.router_state = router_state
+            if router_state:
+                self.data.vppf.become_master_router()
+            else:
+                self.data.vppf.become_backup_router()
+            # Update remote mappings for GPE bound router ports
+            self.data.gpe_listener.update_router_gpe_mappings()
+
+    def removed(self, router_key):
+        token1, token2 = self.parse_key(router_key)
+        if token1 and token2:
+            if token1 != 'floatingip':
+                port_id = token2
+                router_data = self.data.vppf.router_interfaces.get(port_id)
+                # Delete the GPE mapping first as we need to lookup the
+                # router interface mac-address from vppf
+                if router_data and router_data.get('net_type') == TYPE_GPE:
+                    self.add_remove_gpe_mappings(port_id, router_data,
+                                                 is_add=0)
+                self.data.vppf.delete_router_interface_on_host(port_id)
+            else:
+                floating_ip = token2
+                self.data.vppf.disassociate_floatingip(floating_ip)
 
 
 class SecGroupWatcher(etcdutils.EtcdChangeWatcher):
@@ -2670,37 +3399,145 @@ class SecGroupWatcher(etcdutils.EtcdChangeWatcher):
         self.data.reconsider_port_secgroups()
 
 
-class GpeWatcher(etcdutils.EtcdChangeWatcher):
+class RemoteGroupWatcher(etcdutils.EtcdChangeWatcher):
+    """Details on how the remote-group-id rules are updated by the vpp-agent.
+
+    This thread watches the remote-group key space.
+    When VM port associations to security groups are updated, this thread
+    receives an etcd watch event from the server. From the watch event,
+    the thread figures out the set of ports associated with the
+    remote-group-id and the IP addresses of each port.
+
+    After this, this thread updates two data structures.
+    The first one is a dictionary named port_ips, used to keep track of
+    the ports to their list of IP addresses. It has the port UUID as the key,
+    and the value is it's set of IP addresses. The second DS is a dict named
+    remote_group_ports. This is used to keep track of port memberships in
+    remote-groups. The key is the remote_group_id and the value is the set of
+    ports associated with it. These two dictionaries are updated by the thread
+    whenever watch events are received, so the agent always has up to date
+    information on ports, their IPs and the remote-groups association.
+
+    The RemoteGroupWatcher  thread then calls a method named
+    update_remote_group_secgroups with the remote_group_id as the argument.
+    This method figures out which secgroups need to be updated as a result of
+    the watch event. This is done by looking up another dict named
+    remote_group_secgroups that keeps track of all the secgroups that are
+    referencing the remote-group-id inside their rules.
+    The key is the remote-group, and the value is the set of secgroups that
+    are dependent on it.
+
+    The update_remote_group_secgroups method then reads the rules for each of
+    these referencing security-groups and sends it to the method named
+    acl_add_replace with the security-group-uuid and rules as the argument.The
+    acl_add_replace method takes each rule that contains the remote-group-id
+    and computes a product using the list of IP addresses belonging to all
+    the ports in the remote-group. It then calls the acl_add_replace method
+    in vppf to atomically update the relevant VPP ACLs for the security-group.
+
+    """
 
     def do_tick(self):
         pass
 
-    def parse_key(self, gpe_key):
-        m = re.match('([^/]+)' + '/([^/]+)' + '/([^/]+)', gpe_key)
-        vni, hostname, mac = None, None, None
+    def parse_key(self, remote_group_key):
+        m = re.match('([^/]+)' + '/([^/]+)', remote_group_key)
+        remote_group_id, port_id = None, None
         if m:
-            vni = int(m.group(1))
-            hostname = m.group(2)
-            mac = m.group(3)
-        return (vni, hostname, mac)
+            remote_group_id = m.group(1)
+            port_id = m.group(2)
+        return (remote_group_id, port_id)
 
-    def added(self, gpe_key, value):
-        # gpe_key format is "vni/hostname/mac"
-        vni, hostname, mac = self.parse_key(gpe_key)
-        if (vni and hostname and mac and
-                self.data.is_valid_remote_map(vni, hostname)):
-            self.data.vppf.ensure_remote_gpe_mapping(
-                vni=vni,
-                mac=mac,
-                remote_ip=value)
+    def added(self, remote_group_key, value):
+        # remote_group_key format is "remote_group_id/port_id"
+        # Value is a list of IP addresses
+        remote_group_id, port_id = self.parse_key(remote_group_key)
+        if value and remote_group_id and port_id:
+            ip_addrs = jsonutils.loads(value)
+            # The set of IP addresses configured on a port
+            self.data.vppf.port_ips[port_id] = set(ip_addrs)
+            # The set of ports in a security-group
+            self.data.vppf.remote_group_ports[remote_group_id].update(
+                [port_id])
+            LOG.debug("Current remote_group_ports: %s port_ips: %s",
+                      self.data.vppf.remote_group_ports,
+                      self.data.vppf.port_ips)
+            self.data.update_remote_group_secgroups(remote_group_id)
 
-    def removed(self, gpe_key):
-        vni, hostname, mac = self.parse_key(gpe_key)
-        if (vni and hostname and mac and
-                self.data.is_valid_remote_map(vni, hostname)):
-            self.data.vppf.delete_remote_gpe_mapping(
-                vni=vni,
-                mac=mac)
+    def removed(self, remote_group_key):
+        remote_group_id, port_id = self.parse_key(remote_group_key)
+        if remote_group_id and port_id:
+            # Remove the port_id from the remote_group
+            self.data.vppf.remote_group_ports[
+                remote_group_id].difference_update([port_id])
+            LOG.debug("Current remote_group_ports: %s port_ips: %s",
+                      self.data.vppf.remote_group_ports,
+                      self.data.vppf.port_ips)
+            self.data.update_remote_group_secgroups(remote_group_id)
+
+
+class TrunkWatcher(etcdutils.EtcdChangeWatcher):
+    """Watches trunk parent/subport bindings on the host and takes actions.
+
+    Trunk keyspace format.
+    /networking-vpp/nodes/<node-name>/trunks/<UUID of the trunk>
+
+    Sample data format:
+    {"status": "ACTIVE",
+     "name": "trunk-new",
+     "admin_state_up": true,
+     "sub_ports": [
+         {"segmentation_id": 11,
+          "uplink_seg_id": 149,
+          "segmentation_type": "vlan",
+          "uplink_seg_type": "vlan",
+          "port_id": "9ee91c37-9150-49ff-9ea7-48e98547771a",
+          "physnet": "physnet1"},
+
+         {"segmentation_id": 12,
+          "uplink_seg_id": 139,
+          "segmentation_type": "vlan",
+          "uplink_seg_type": "vlan",
+          "port_id": "2b1a89ba-78f1-4350-b71a-7caf7f23cbcf",
+          "physnet": "physnet1"}],
+    }
+    How does it work?
+    The ml2 server:
+    1) Writes above etcd key/value when a trunk port is bound on the host.
+    2) Updates the above value when subports on a bound trunk are updated.
+    3) Deletes the key when the trunk is unbound.
+    The trunkwatcher receives the watch event and it figures out whether
+    it should perform a bind or unbind action on the parent and its subport
+    and performs it.
+    """
+
+    def do_tick(self):
+        """Invoked every TRUNK_WATCHER_HEARTBEAT secs"""
+        # Check if there are child ports to be bound and brought UP
+        self.data.reconsider_trunk_subports()
+
+    def added(self, parent_port, value):
+        """Bind and unbind sub-ports of the parent port."""
+        data = jsonutils.loads(value)
+        LOG.debug('trunk watcher received add for parent_port %s '
+                  'with data %s', parent_port, data)
+        # Due to out-of-sequence etcd watch events during an agent restart,
+        # we do not yet know at this point whether the parent port is setup.
+        # So, we'll add it to the awaiting parents queue and reconsider it.
+        self.data.subports_awaiting_parents[parent_port] = data['sub_ports']
+        # reconsider awaiting sub_ports
+        self.data.reconsider_trunk_subports()
+
+    def removed(self, parent_port):
+        """Unbind all sub-ports and then unbind the parent port."""
+        LOG.debug('trunk watcher received unbound for parent port %s ',
+                  parent_port)
+        # First, unbind all subports
+        self.data.bind_unbind_subports(parent_port, subports=[])
+        # Then, unbind the parent port if it has no subports
+        if not self.data.bound_subports[parent_port]:
+            LOG.debug('Unbinding the parent port %s', parent_port)
+            self.data.vppf.unbind_interface_on_host(parent_port)
 
 
 class BindNotifier(object):
@@ -2720,6 +3557,7 @@ class BindNotifier(object):
         self.state_key_space = state_key_space
 
         self.etcd_client = client_factory.client()
+        self.etcd_writer = etcdutils.json_writer(self.etcd_client)
 
     def add_notification(self, id, content):
         """Queue a notification for sending to Nova
@@ -2739,9 +3577,10 @@ class BindNotifier(object):
 
                 (port, props) = ent
 
-                self.etcd_client.write(
+                # TODO(ijw): do we ever clean this space up?
+                self.etcd_writer.write(
                     self.state_key_space + '/%s' % port,
-                    jsonutils.dumps(props))
+                    props)
             except Exception:
                 # We must keep running, but we don't expect problems
                 LOG.exception("exception in bind-notify thread")
@@ -2761,21 +3600,37 @@ class VPPRestart(object):
         time.sleep(self.timeout)  # TODO(najoy): check if vpp is actually up
 
 
-def main():
-    cfg.CONF(sys.argv[1:])
-    logging.setup(cfg.CONF, 'vpp_agent')
+def openstack_base_setup(process_name):
+    """General purpose entrypoint
 
+    Sets up non-specific bits (the integration with OpenStack and its
+    config, and so on).
+    """
+    # Arguments, config files and options
+    cfg.CONF(sys.argv[1:])
+
+    # General logging
+    logging.setup(cfg.CONF, process_name)
+
+    # Guru meditation support enabled
     gmr_opts.set_defaults(cfg.CONF)
     gmr.TextGuruMeditation.setup_autorun(
         version.version_info,
         service_name='vpp-agent')
-    # If the user and/or group are specified in config file, we will use
-    # them as configured; otherwise we try to use defaults depending on
-    # distribution. Currently only supporting ubuntu and redhat.
-    cfg.CONF.register_opts(config_opts.vpp_opts, "ml2_vpp")
-    if cfg.CONF.ml2_vpp.enable_vpp_restart:
-        VPPRestart().wait()
 
+
+def main():
+    """Main function for VPP agent functionality."""
+
+    openstack_base_setup('vpp_agent')
+
+    setup_privsep()
+
+    compat.register_ml2_base_opts(cfg.CONF)
+    compat.register_securitygroups_opts(cfg.CONF)
+    config_opts.register_vpp_opts(cfg.CONF)
+
+    # Pull physnets out of config and interpret them
     if not cfg.CONF.ml2_vpp.physnets:
         LOG.critical("Missing physnets config. Exiting...")
         sys.exit(1)
@@ -2799,16 +3654,22 @@ def main():
                 sys.exit(1)
             physnets[k] = v
 
+    # Deal with VPP-side setup
+
+    if cfg.CONF.ml2_vpp.enable_vpp_restart:
+        VPPRestart().wait()
+
     # Convert to the minutes unit that VPP uses:
     # (we round *up*)
-    mac_age_min = int((cfg.CONF.ml2_vpp.mac_age + 59) / 60)
+    # py3 note: using // since we want integer division
+    mac_age_min = int((cfg.CONF.ml2_vpp.mac_age + 59) // 60)
     vppf = VPPForwarder(physnets,
                         mac_age=mac_age_min,
-                        tap_wait_time=cfg.CONF.ml2_vpp.tap_wait_time,
                         vpp_cmd_queue_len=cfg.CONF.ml2_vpp.vpp_cmd_queue_len,
-                        gpe_src_cidr=cfg.CONF.ml2_vpp.gpe_src_cidr,
-                        gpe_locators=cfg.CONF.ml2_vpp.gpe_locators,
+                        read_timeout=cfg.CONF.ml2_vpp.read_timeout
                         )
+
+    # Deal with etcd-side setup
 
     LOG.debug("Using etcd host:%s port:%s user:%s password:***",
               cfg.CONF.ml2_vpp.etcd_host,
@@ -2817,7 +3678,17 @@ def main():
 
     client_factory = etcdutils.EtcdClientFactory(cfg.CONF.ml2_vpp)
 
+    # Do the work
+
     ops = EtcdListener(cfg.CONF.host, client_factory, vppf, physnets)
+
+    names = cfg.CONF.ml2_vpp.vpp_agent_extensions
+    if names is not '':
+        mgr = ExtensionManager(
+            'networking_vpp.vpp_agent.extensions',
+            names,
+            VPPAgentExtensionBase)
+        mgr.call_all('run', cfg.CONF.host, client_factory, vppf, ops.pool)
 
     ops.process_ops()
 

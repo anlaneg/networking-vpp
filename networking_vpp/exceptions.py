@@ -14,18 +14,43 @@
 #    under the License.
 
 from networking_vpp._i18n import _
-from networking_vpp.compat import n_exec
+from networking_vpp.compat import n_exc
 
 
-class InvalidEtcdCAConfig(n_exec.NeutronException):
+class InvalidEtcdCAConfig(n_exc.NeutronException):
     message = _("Invalid etcd CA config.")
 
 
-class InvalidEtcHostsConfig(n_exec.NeutronException):
+class InvalidEtcHostsConfig(n_exc.NeutronException):
     message = _("Invalid etc host config. Expect comma-separated list of "
                 "<Host> or <Host:Port> format")
 
 
-class InvalidEtcHostConfig(n_exec.NeutronException):
+class InvalidEtcHostConfig(n_exc.NeutronException):
     message = _("Invalid etc host config. Expect an IP or host name in "
                 "the form <Host> or <Host:Port>")
+
+
+class GpeVNIRangeError(n_exc.NeutronException):
+    """An exception indicating an invalid GPE VNI range was specified.
+
+    :param vni_range: The invalid vni range specified in the
+                      'start:end' format
+    """
+    message = _("Invalid VNI range string for the GPE network. Expect a "
+                "string in the form %(vni_range)s")
+
+    def __init__(self, **kwargs):
+        # Convert the vni_range tuple to 'start:end' format for display
+        if isinstance(kwargs['vni_range'], tuple):
+            kwargs['vni_range'] = "%d:%d" % kwargs['vni_range']
+        super(GpeVNIRangeError, self).__init__(**kwargs)
+
+
+class GpeVNIInUse(n_exc.NeutronException):
+    """GPE network creation failed exception due to the VNI being in use.
+
+    :param vni_id: The ID of the GPE VNI that's in use.
+    """
+    message = _("Invalid GPE VNI value %(vni_id)s for allocation "
+                "The VNI is already in use by another GPE network")

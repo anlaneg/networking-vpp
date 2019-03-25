@@ -13,4 +13,9 @@ python-etcd>=0.4.3
 eventlet
 ipaddress
 click
-oslo_serialization
+oslo.serialization
+PyJWT
+cryptography>=2.0,<3
+pyOpenSSL
+pyinotify
+six

@@ -19,6 +19,7 @@ import atexit
 import etcd
 import eventlet
 import eventlet.semaphore
+from oslo_config import cfg
 from oslo_log import log as logging
 import re
 import six
@@ -26,13 +27,218 @@ import time
 from urllib3.exceptions import TimeoutError as UrllibTimeoutError
 import uuid
 
+from networking_vpp._i18n import _
 from networking_vpp import exceptions as vpp_exceptions
+from networking_vpp import jwt_agent
+
+from oslo_serialization import jsonutils
 
 
 LOG = logging.getLogger(__name__)
 
 ETC_HOSTS_DELIMITER = ','
 ETC_PORT_HOST_DELIMITER = ':'
+
+
+@six.add_metaclass(ABCMeta)
+class EtcdWriter(object):
+
+    @abstractmethod
+    def _process_read_value(self, key, value):
+        """Turn a string from etcd into a value in the style we prefer
+
+        May parse, validate and/or otherwise modify the result.
+        """
+
+        pass
+
+    @abstractmethod
+    def _process_written_value(self, key, value):
+        """Turn a value into a serialised string to store in etcd
+
+        May serialise, sign and/or otherwise modify the result.
+        """
+        pass
+
+    def __init__(self, etcd_client):
+        self.etcd_client = etcd_client
+
+    def write(self, key, data, *args, **kwargs):
+        """Serialise and write a single data key in etcd.
+
+        The value is received as a Python data structure and stored in
+        a conventional format (serialised to JSON, in this class
+        instance).
+
+        """
+        data = self._process_written_value(key, data)
+
+        self.etcd_client.write(key, data, *args, **kwargs)
+
+    def read(self, *args, **kwargs):
+        """Watch and parse a data key in etcd.
+
+        The value is stored in a conventional format (serialised
+        somehow) and we parse it to Python.  This may throw an
+        exception if the data cannot be read when .value is called on
+        any part of the result.
+
+        """
+        return ParsedEtcdResult(self,
+                                self.etcd_client.read(*args, **kwargs))
+
+    def watch(self, *args, **kwargs):
+        """Watch and parse a data key in etcd.
+
+        The value is stored in a conventional format (serialised
+        somehow) and we parse it to Python.  This may throw an
+        exception if the data cannot be read when .value is called on
+        any part of the result.
+
+        """
+
+        return ParsedEtcdResult(self,
+                                self.etcd_client.watch(*args, **kwargs))
+
+    def delete(self, key):
+        # NB there's no way of clearly indicating that a delete is
+        # legitimate - the parser has no role in it, here.
+
+        # We do augment the delete to delete more throroughly.  This
+        # should probably be a mixin.
+        try:
+            self.etcd_client.delete(key)
+        except etcd.EtcdNotFile:
+            # We are asked to delete a directory as in the
+            # case of GPE where the empty mac address directory
+            # needs deletion after the key (IP) has been deleted.
+            try:
+                # TODO(ijw): define semantics: recursive delete?
+                self.etcd_client.delete(key, dir=True)
+            except Exception:  # pass any exceptions
+                pass
+        except etcd.EtcdKeyNotFound:
+            # The key may have already been deleted
+            # no problem here
+            pass
+
+
+def _unchanged(name):
+    def pt_get(self):
+        return getattr(self._result, name)
+
+    return property(pt_get)
+
+
+class ParsedEtcdResult(etcd.EtcdResult):
+    """Parsed version of an EtcdResult
+
+    An equivalent to EtcdResult that processes its values using the
+    parser that the reading class implements.
+    """
+
+    def __init__(self, reader, result):
+
+        self._reader = reader
+        self._result = result
+
+    # A whole set of result properties are as they are on the original
+    # result.
+
+    key = _unchanged('key')
+    expiration = _unchanged('expiration')
+    ttl = _unchanged('ttl')
+    modifiedIndex = _unchanged('modifiedIndex')
+    createdIndex = _unchanged('createdIndex')
+    newKey = _unchanged('newKey')
+    dir = _unchanged('dir')
+    etcd_index = _unchanged('etcd_index')
+    raft_index = _unchanged('raft_index')
+    action = _unchanged('action')
+
+    # support iteration over result's children
+    children = _unchanged('children')
+
+    # used internally by etcd.client.Client
+    _prev_node = _unchanged('_prev_node')
+
+    # The one special case, where we need to change things
+    @property
+    def value(self):
+        return self._reader._process_read_value(self._result.key,
+                                                self._result.value)
+
+    def get_subtree(self, *args, **kwargs):
+        for f in self._result.get_subtree(*args, **kwargs):
+            # This returns a value which may itself have a subtree
+            # depending on args passed
+
+            return ParsedEtcdResult(self._reader, f)
+
+    # We know a bit too much about the internals of EtcdResult, but
+    # given that, we know that the internals all work from .value or
+    # .get_subtree() and the rest of the calls should use parsed
+    # result values.
+
+
+def json_writer(etcd_client):
+    if cfg.CONF.ml2_vpp.jwt_signing:
+        return SignedEtcdJSONWriter(etcd_client)
+    else:
+        return EtcdJSONWriter(etcd_client)
+
+
+class EtcdJSONWriter(EtcdWriter):
+    """Write Python datastructures to etcd in a consistent form.
+
+    This takes values (typically as Python datastructures) and
+    converts them using JSON serialisation to a form that can be
+    stored in etcd, and vice versa.
+
+    """
+
+    def __init__(self, etcd_client):
+        super(EtcdJSONWriter, self).__init__(etcd_client)
+
+    def _process_read_value(self, key, value):
+        value = jsonutils.loads(value)
+        return value
+
+    def _process_written_value(self, key, value):
+        return jsonutils.dumps(value)
+
+
+class SignedEtcdJSONWriter(EtcdJSONWriter):
+    """Write Python datastructures to etcd in a consistent form.
+
+    This takes values (typically as Python datastructures) and
+    converts them using JSON serialisation to a form that can be
+    stored in etcd, and vice versa.
+
+    """
+
+    def __init__(self, etcd_client):
+        self.jwt_agent = jwt_agent.JWTUtils(
+            cfg.CONF.ml2_vpp.jwt_node_cert,
+            cfg.CONF.ml2_vpp.jwt_node_private_key,
+            cfg.CONF.ml2_vpp.jwt_ca_cert,
+            cfg.CONF.ml2_vpp.jwt_controller_name_pattern)
+        super(SignedEtcdJSONWriter, self).__init__(etcd_client)
+
+    def _process_read_value(self, key, value):
+        value = jsonutils.loads(value)
+        if (self.jwt_agent.should_path_be_signed(key)):
+            signerNodeName = self.jwt_agent.get_signer_name(key)
+            value = self.jwt_agent.verify(signerNodeName,
+                                          key,
+                                          value)
+        return value
+
+    def _process_written_value(self, key, value):
+        if (self.jwt_agent.should_path_be_signed(key)):
+            value = self.jwt_agent.sign(key, value)
+        return jsonutils.dumps(value)
+
 
 elector_cleanup = []
 
@@ -41,6 +247,10 @@ elector_cleanup = []
 def cleanup_electors():
     for f in elector_cleanup:
         f.clean()
+
+
+class EtcdElectionLost(Exception):
+    pass
 
 
 class EtcdElection(object):
@@ -97,7 +307,7 @@ class EtcdElection(object):
         elector_cleanup.append(self)
 
     def wait_until_elected(self):
-        """Elect a master thread among a group of worker threads.
+        """Wait indefinitely until we are the only master among a pool of workers.
 
         Election Algorithm:-
         1) Each worker thread is assigned a unique thread_id at launch time.
@@ -120,12 +330,9 @@ class EtcdElection(object):
            which begins doing the work.
 
         """
-        # Start the election
         attempt = 0
         while True:
-            attempt = attempt + 1
-            # LOG.debug('Thread %s attempting to get elected for %s, try %d',
-            #           self.thread_id, self.name, attempt)
+            attempt += 1
             try:
                 # Attempt to become master
                 self.etcd_client.write(self.master_key,
@@ -140,29 +347,20 @@ class EtcdElection(object):
             # the master
             except etcd.EtcdException:
                 try:
-                    # LOG.debug('Thread %s refreshing master for %s, try %d',
-                    #           self.thread_id, self.name, attempt)
+                    # We may already be the master.  Extend the election time.
+                    self.extend_election(self.work_time)
 
-                    # Refresh TTL if master == us, then break to do work
-                    # TODO(ijw): this can be a refresh
-                    self.etcd_client.write(self.master_key,
-                                           self.thread_id,
-                                           prevValue=self.thread_id,
-                                           ttl=self.work_time)
-                    LOG.debug('Thread %s refreshed master for %s, try %d',
+                    LOG.debug('Thread %s refreshed master for %s for try %d',
                               self.thread_id, self.name, attempt)
                     break
                 # All non-master threads will end up here, watch for
                 # recovery_time (in case some etcd connection fault means
                 # we don't get a watch notify) and become master if the
                 # current master is dead
-                except etcd.EtcdException:
-                    # LOG.debug('Thread %s failed to elect and is '
-                    #           'waiting for %d secs, group %s, try %d',
-                    #           self.thread_id, self.recovery_time,
-                    #           self.name, attempt)
+                except EtcdElectionLost:
                     try:
-                        with eventlet.Timeout(self.recovery_time + 5, False):
+                        with eventlet.Timeout(self.recovery_time + 1, False):
+                            # Most threads will be waiting here.
                             self.etcd_client.watch(
                                 self.master_key,
                                 timeout=self.recovery_time)
@@ -170,6 +368,19 @@ class EtcdElection(object):
                         pass
                     except etcd.EtcdException:
                         eventlet.sleep(self.recovery_time)
+
+    def extend_election(self, duration):
+        """Assuming we are the master, attempt to extend our election time."""
+
+        try:
+            self.etcd_client.write(self.master_key,
+                                   self.thread_id,
+                                   prevValue=self.thread_id,
+                                   ttl=duration)
+            LOG.debug("Master thread %s extended election by %d secs",
+                      self.thread_id, duration)
+        except etcd.EtcdException:
+            raise EtcdElectionLost()
 
     def clean(self):
         """Release the election lock if we're currently elected.
@@ -291,12 +502,11 @@ class EtcdWatcher(object):
             # abstract.
             return
 
-            stale_keys = self.expected_keys - set(short_keys)
-            for f in stale_keys:
-                self.removed(f)
+        stale_keys = set(self.expected_keys) - set(short_keys)
+        for f in stale_keys:
+            self.removed(f)
 
     def do_work(self, action, key, value):
-
         """Process an indiviudal update received in a watch
 
         Override this if you can deal with individual updates given
@@ -423,7 +633,7 @@ class EtcdWatcher(object):
                             self.do_work(rv.action, rv.key, rv.value)
                         except Exception:
                             LOG.exception(('%s key %s value %s could'
-                                          'not be processed')
+                                           'not be processed')
                                           % (rv.action, rv.key, rv.value))
                             # TODO(ijw) raise or not raise?  This is probably
                             # fatal and incurable, because we will only repeat
@@ -575,9 +785,53 @@ class EtcdHelper(object):
             # Thrown when the directory already exists, which is fine
             pass
 
+    def remove_dir(self, path):
+        try:
+            self.etcd_client.delete(path, dir=True)
+        except etcd.EtcdNotFile:
+            # Thrown if the directory is not empty, which we error log
+            LOG.error("Directory path:%s is not empty and cannot be deleted",
+                      path)
+        except etcd.EtcdKeyNotFound:
+            # Already gone, so not a problem
+            pass
+
+# Base connection to etcd, using standard options.
+
+_etcd_conn_opts = [
+    cfg.StrOpt('etcd_host', default="127.0.0.1",
+               help=_("Etcd host IP address(es) to connect etcd client."
+                      "It takes two formats: single IP/host or a multiple "
+                      "hosts list with this format: 'IP:Port,IP:Port'. "
+                      "e.g: 192.168.1.1:2379,192.168.1.2:2379.  If port "
+                      "is absent, etcd_port is used.")),
+    cfg.IntOpt('etcd_port', default=4001,
+               help=_("Etcd port to connect the etcd client.  This can "
+                      "be overridden on a per-host basis if the multiple "
+                      "host form of etcd_host is used.")),
+    cfg.StrOpt('etcd_user', default=None,
+               help=_("Username for etcd authentication")),
+    cfg.StrOpt('etcd_pass', default=None, secret=True,
+               help=_("Password for etcd authentication")),
+    # TODO(ijw): make false default
+    cfg.BoolOpt('etcd_insecure_explicit_disable_https', default=True,
+                help=_("Use TLS to access etcd")),
+    cfg.StrOpt('etcd_ca_cert', default=None,
+               help=_("etcd CA certificate file path")),
+]
+
+
+def register_etcd_conn_opts(cfg, group):
+    global _etcd_conn_opts
+    cfg.register_opts(_etcd_conn_opts, group)
+
+
+def list_opts():
+    """Return config details for use with Oslo-config generator"""
+    return _etcd_conn_opts
+
 
 class EtcdClientFactory(object):
-
     def _parse_host(self, etc_host_elem, default_port):
         """Parse a single etcd host entry (which can be host or host/port)
 
@@ -624,22 +878,22 @@ class EtcdClientFactory(object):
 
         return etc_hosts
 
-    def __init__(self, ml2_vpp_conf):
-        hostconf = self._parse_host_config(ml2_vpp_conf.etcd_host,
-                                           ml2_vpp_conf.etcd_port)
+    def __init__(self, conf_group):
+        hostconf = self._parse_host_config(conf_group.etcd_host,
+                                           conf_group.etcd_port)
 
         self.etcd_args = {
             'host': hostconf,
-            'username': ml2_vpp_conf.etcd_user,
-            'password': ml2_vpp_conf.etcd_pass,
+            'username': conf_group.etcd_user,
+            'password': conf_group.etcd_pass,
             'allow_reconnect': True}
 
-        if not ml2_vpp_conf.etcd_insecure_explicit_disable_https:
-            if ml2_vpp_conf.etcd_ca_cert is None:
+        if not conf_group.etcd_insecure_explicit_disable_https:
+            if conf_group.etcd_ca_cert is None:
                 raise vpp_exceptions.InvalidEtcdCAConfig()
 
             self.etcd_args['protocol'] = 'https'
-            self.etcd_args['ca_cert'] = ml2_vpp_conf.etcd_ca_cert
+            self.etcd_args['ca_cert'] = conf_group.etcd_ca_cert
 
         else:
             LOG.warning("etcd is not using HTTPS, insecure setting")

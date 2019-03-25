@@ -32,7 +32,7 @@ There's a devstack plugin. You can add this plugin to your ``local.conf``
 and see it working. The devstack plugin now takes care of
 
 - installing the networking-vpp code
-- installing VPP itself (version 17.04)
+- installing VPP itself (version 18.04)
 - installing etcd
 - using a QEMU version that supports vhostuser well
 
@@ -172,7 +172,7 @@ does depend a bit on your hardware setup, so you may need to run
 devstack, then run the command 'sudo vppctl show int' - which will
 list the interfaces that VPP found - fix the ``local.conf`` file and try
 again.  (If your situation is especially unusual, you will need to go
-look at VPP's documentation at <http://wiki.fd.io/> to work out how
+look at VPP's documentation at <https://wiki.fd.io/> to work out how
 VPP chooses its interfaces and things about how its passthrough
 drivers work). If you're setting up a multinode system, bridge this
 between the servers and it will form the Neutron dataplane link.
@@ -227,7 +227,7 @@ If the specified VPP uplink interface in the physnet list is ``tap-0``, the
 plugin will create it in VPP to use if it's not already present
 (and you won't have to give a physical interface up to VPP and work out the
 configuration steps, which can be quite involved).  This will turn up on
-your host as an interface called 'test', which you should be able to use normally -
+your host as an interface named 'test', which you should be able to use normally -
 you can give it an address, add routes, set up NAT or even make VLAN subinterfaces.
 
 Take a peek into the ``init_networking_vpp`` function of ``devstack/plugin.sh``
@@ -250,7 +250,7 @@ you're using.  Refer to the VPP documentation if you need more help.
 If running on VirtualBox you will need to use an experimental option
 to allow SSE4.2 passthrough from the host CPU to the VM. Refer to
 the `VirtualBox Manual <https://www.virtualbox.org/manual/ch09.html#sse412passthrough>`_
- for details.
+for details.
 
 What overlays does it support?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -328,76 +328,104 @@ driver, in conjunction with the other ones on the system, needs to do
 anything. In some cases it may not be responsible for the port at all.
 
 How do I enable the vpp-router plugin?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-NOTE: As of release 17.04 The native L3 service plugin (``vpp-router``) is
-      experimental. Use it for *evaluation and development purposes only*.
+NOTE: As of release 18.04, the native L3 service plugin (``vpp-router``) is
+      fully supported in L3 HA configuration for VLAN, Flat and VXLAN-GPE
+      type networks.
 
 To enable the vpp-router plugin add the following in neutron.conf::
 
     service_plugins = vpp-router
 
-And make sure the *Openstack L3 agent is not running*. You will need to nominate
-a host to act as the Layer 3 gateway host in ml2_conf.ini::
+And make sure the *Openstack L3 agent is not running*. You will need to
+nominate one or more hosts to act as the Layer 3 gateway host(s) in
+ml2_conf.ini::
 
     [ml2_vpp]
-    l3_host = <my_l3_gateway_host.domain>
+    l3_hosts = <my_l3_gateway_host.domain>
 
-The L3 host will need L2 adjacency and connectivity to the compute hosts to
+The L3 host(s) will need L2 adjacency and connectivity to the compute hosts to
 terminate tenant VLANs and route traffic properly.
 
 *The vpp-agent acts as a common L2 and L3 agent so it needs to be started on
 the L3 host as well*.
 
-How does it talk to VPP?
-~~~~~~~~~~~~~~~~~~~~~~~~
+How do I enable Layer3 HA?
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+In the 18.04 release, we fully support Layer3 HA for VPP.
+
+First, ensure that the vpp-router plugin is enabled.
+
+Next, enable Layer3 HA by adding ``enable_l3_ha=True`` in the ml2.ini
+configuration file (as shown below).
+
+Lastly, you need to  provide the list of Layer3 hosts in your deployment,
+using a comma separated notation (as shown below) in the ml2.ini configuration
+file.
+
+Sample L3 host settings in ml2_conf.ini
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+::
+
+    [ml2_vpp]
+    l3_hosts = node1,node2
+    enable_l3_ha = True
+
+How does Layer3 HA Work and how do I test it?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+We use the keepalived to do the ACTIVE/BACKUP router election using VRRP.
+You can find these sample keepalived config files and scripts in the
+/tools directory.
+
+First, you need to decide which node will become the master.
+Use the keepalived.master.conf file on the master node,
+and the keepalived.backup.conf on all the backup nodes.
+Just copy these files from the tools directory to /etc/keepalived.conf
+on the respective nodes.
+
+Now, when there is a state transition to MASTER, keepalived will run the
+script named master.sh, to notify the master election, and
+it will run the backup.sh, when the node state transitions
+to BACKUP. These scripts are also in the /tools directory.
+
+The argument required for each of these scripts is the ${hostname}
+of the node. These scripts update a key in etcd used to control
+the router state.
+
+The etcd key is: "/networking-vpp/nodes/${HOSTNAME}/routers/ha"
+The value of this key is set to 1 on the MASTER node and 0 on the BACKUP.
+If the key is not present or it's value unset, the router will become
+a BACKUP.
+
+NOTE: If you are on a non-HA environment, i.e., there's a single network
+node, set enable_l3_ha=False in ml2_conf.ini
+
+The vpp-agent listens for watch events on this key.
+On the master node, the router BVI interfaces are enabled and
+they are disabled on all the backup nodes.
+
+How does the vpp-agent talk to VPP?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 This uses the Python API module that comes with VPP (``vpp_papi``). VPP has
 an admin channel, implemented in shared memory, to exchange control
 messages with whatever agent is running. The Python bindings are a very
 thin layer between that shared memory system and a set of Python APIs.
 We add our own internal layer of Python to turn vpp's low level
-communcations into something a little easier to work with.
+communications into something a little easier to work with.
 
 What does it support?
 ~~~~~~~~~~~~~~~~~~~~~
 
-For now, assume it moves packets to where they need to go. unless
+For now, assume it moves packets to where they need to go, unless
 they're firewalled, in which case it doesn't. It also integrates
 properly with stock ML2 L3, DHCP and Metadata functionality.
 In the 17.01 release, we supported the ACL functionality added for VPP 17.01.
 This includes security groups, the anti-spoof filters 
 (including the holes for things like DHCP), the allowed address pair
 extension and the port security flag.
-
-What have you just done?
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-In the 17.04 release, we have implemented an overlay networking 
-using VXLAN GPE, which has better horizontal scale than VLAN based overlays.
-
-We have implemented L3 in VPP. In this case, using the same etcd
-and agent and an additional Neutron L3 driver, you'll be able to use
-VPP to create Neutron routers complete with NAT and floating
-IPs.
-
-We have tuned up the performance a bit by implementing a thread election
-algorithm that limits the number of server threads running to a single
-forward and reverse worker thread. If the primary worker thread fails,
-the sleeping threads will detect this, elect a master and start doing
-the work.
-
-And we've dealt with restart cases.  When you run in production you should
-now be able to restart the agent (for upgrade, for instance) without
-stopping VPP - it will 'catch up' the state of VPP when it restarts, so
-you can do this upgrade without ever interrupting the traffic (a key
-requirement of NFV workloads).  If you do want to restart VPP, we
-recommend stopping the agent, then VPP, then starting VPP and then the agent
-- which will, again, catch up the state of VPP to where it needs to be (VPP
-is just a dataplane and always restarts with no state).
-
-We've dropped the privilege of the agent.  This means it runs as a normal
-user and limits the damage it could cause if anything went wrong.
 
 What is VXLAN-GPE and how can I get it to work?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -407,28 +435,28 @@ underlay network to transport Layer2 and Layer3 packets (a.k.a overlay) sent
 by tenant instances.
 
 At this point, we only support Layer2 overlays between bridge domains using
-the existing ML2 "vxlan" type driver.
+the included "gpe" type driver.
 
 Following are some key concepts that will help you set it up and get going.
 
 First, it's much easier than what you think it is! Most of the complexities
 are handled in the code to make the user experience and service deployment
-much easier. We will walk you though all of it.
+much easier. We will walk you through all of it.
 
 If you are just interested in setting it up, you only need to understand
-the concept of a locator.VPP uses this name to identify the uplink interface
+the concept of a locator. VPP uses this name to identify the uplink interface
 on each compute node as the GPE underlay. If you are using devstack, just
 set the value of the variable "GPE_LOCATORS" to the name of the physnet
-that you want to use as the underlay interface on that compute node. 
+that you want to use as the underlay interface on that compute node.
 
 Besides this, set the devstack variable "GPE_SRC_CIDR" to a CIDR value for
 the underlay interface. The agent will program the underlay interface in VPP
-with the IP/mask value you set for this variable. 
+with the IP/mask value you set for this variable.
 
 In the current implementation, we only support one GPE locator per compute
 node.
 
-These are the only two new settings you need to know to get GPE working. 
+These are the only two new settings you need to know to get GPE working.
 
 Also ensure, that you have enabled vxlan as one of the tenant_network_type
 settings and allocated some vni's in the vni_ranges. It is a good practice
@@ -436,7 +464,7 @@ to keep your VLAN and VXLAN ranges in separate namespaces to avoid any
 conflicts.
 
 We do assume that you have setup IP routing for the locators within your
-network to enable all the underlay interfaces to reach one-another via either 
+network to enable all the underlay interfaces to reach one-another via either
 IPv4 or IPv6. This is required for GPE to deliver the encapsulated Layer2
 packets to the target locator.
 
@@ -469,28 +497,21 @@ watch events are uninteresting and ignored.
 the current implementation, we only support one locator within
 a pre-configured locator_set.
 
-Are there any limitations for VXLAN GPE?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-In the current release, broadcast layer2 packets are not supported.
-So for VM's to ping each other using GPE, they require a static ARP entry.
-
 Any known issues?
 ~~~~~~~~~~~~~~~~~
 
 In general, check the bugs at
 <https://bugs.launchpad.net/networking-vpp> - but worth noting:
 
--  Security groups don't yet support the remote_security_group_id
-   parameter. If you use this they will ignore it and accept traffic
-   from any source.
--  Some failure cases (agent reset, VPP reset) leave the agent
+-  SNAT setting may use the uplink interface on certain occasions besides
+   the BVI interfaces.
+-  Some failure cases (VPP reset) leave the agent
    wondering what state VPP is currently in. For now, in these cases,
-   we take the coward's way out and reset the agent and VPP
-   simultaneously, recreating its state from what's in etcd. This
-   works, and will not go wrong, but you'll see a pause in your VM
-   traffic as it happens. At the moment, you'll most commonly see this
-   on software upgrades. See below for what we're doing about this.
+   we take the coward's way out and reset the agent at the same time.
+   This adds a little bit of thinking time (maybe a couple of seconds)
+   to the pause you see because the virtual switch went down.  It's still
+   better than OVS or LinuxBridge - if your switch went down (or you
+   needed to upgrade it) the kernel resets and the box reboots.
 
 What are you doing next?
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -498,13 +519,8 @@ What are you doing next?
 We also keep our job list in <https://bugs.launchpad.net/networking-vpp>
 anything starting 'RFE' is a 'request for enhancement'.
 
-We will be hardening the native L3 router implementation (vpp-router) in
-future releases. This will include fixes to the etcd communication routines,
-support for resync and high availablilty. Support for L3 extensions like
-extraroute etc. will also be added to the service plugin.
-
-We'll be dealing with a few of the minor details of a good Neutron
-network driver, like sorting out MTU configuration.
+We'll be dealing with TaaS and a plugin code manager in the upcoming 18.04.1
+release.
 
 What can I do to help?
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -547,10 +563,41 @@ and the agents know that they must resync themselves with the desired
 state when they completely lose track of what's happening.
 
 How are you testing the project during development?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 We have unit tests written by developers, and are also doing system tests
 by leveraging the upstream Openstack CI infrastructure. Going forward,
 we will be increasing the coverage of the unit tests, as well as
 enhancing the types of system/integration tests that we run, e.g.
 negative testing, compatibility testing, etc.
+
+What's new in the 19.03 release?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In the 19.03 release, we made a few changes to add functionality:
+
+- To complement the GPE overlay, there is now also a L3 solution for port
+  mirroring (OpenStack TaaS) connections.  When you're using GPE, the
+  overlay is L3 and you may have routers between your compute nodes, so
+  moving the TAP traffic around also requires an L3 overlay.  We use
+  VXLAN point to point connections to get that copy of traffic to the
+  VM destination, and these can be routed over L3.
+
+  We automatically use VXLAN connections when you're tapping ports on
+  GPE networks and VLAN connections for L2 networks so this should all
+  Just Work.
+
+- We've worked on out Python 3 compatibility in preparation for the
+  EOL of Python 2.7. Both the Neutron server's driver components and the
+  agent components that control VPP should now support Python 3.5, but this
+  work is ongoing and if you do find any issues please report them
+  on the Launchpad page.
+
+- We've worked on our L3 Neutron routers support and added functionality
+  that allows you to use NAT from multiple routers simultaneously -
+  ideal if, for instance, you like to use one router per tenant and in
+  more unusual cases routers with different external networks.
+
+- We've been doing the usual round of bug fixes and updates - the code
+  will work with both VPP 18.10 and 19.01 and has been updated to
+  keep up with Neutron Rocky and Stein.

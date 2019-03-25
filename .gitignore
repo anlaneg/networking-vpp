@@ -5,10 +5,10 @@ build
 .tox
 *.swp
 *~
-.testrepository/
 .idea/
 .#*
 #*#
 .project
 .pydevproject
 .DS_Store
+.stestr

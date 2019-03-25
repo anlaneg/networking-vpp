@@ -35,15 +35,15 @@ function install_networking_vpp {
 
 function init_networking_vpp {
     # In test environments where the network topology is unknown or cannot
-    # be modified, we use 'tap-0' as a logical interface by default
+    # be modified, we use 'tap0' as a logical interface by default
     if ! [ -z "$MECH_VPP_PHYSNETLIST" ]; then
         uplink=$(echo $MECH_VPP_PHYSNETLIST | cut -d ':' -f 2)
-        # checking specifically for tap-0 to avoid problems in developer
+        # checking specifically for tap0 to avoid problems in developer
         # test envs where other logical interfaces may be specified.
-        if ! [[ `vppctl show interfaces` =~ "$uplink" ]] && [[ "$uplink" == 'tap-0' ]]; then
-            echo "$uplink not found in vppctl show interfaces"
-            # by default, vpp will internally name the first tap device 'tap-0'
-            vppctl tap connect test
+        if ! [[ `vppctl show interface` =~ "$uplink" ]] && [[ "$uplink" == 'tap0' ]]; then
+            echo "$uplink not found in vppctl show interface"
+            # by default, vpp will internally name the first tap device 'tap0'
+            vppctl create tap host-if-name test
             vppctl set interface state $uplink up
         fi
     fi
@@ -58,12 +58,25 @@ function configure_networking_vpp {
     iniset /$Q_PLUGIN_CONF_FILE ml2_vpp enable_vpp_restart $ENABLE_VPP_RESTART
     iniset /$Q_PLUGIN_CONF_FILE ml2_vpp gpe_src_cidr $GPE_SRC_CIDR
     iniset /$Q_PLUGIN_CONF_FILE ml2_vpp gpe_locators $GPE_LOCATORS
+    iniset /$Q_PLUGIN_CONF_FILE ml2_vpp l3_hosts $L3_HOSTS
 
     if [ ! -z "$ETCD_CA_CERT" ] ; then
        iniset /$Q_PLUGIN_CONF_FILE ml2_vpp etcd_ca_cert $ETCD_CA_CERT
     else
        iniset /$Q_PLUGIN_CONF_FILE ml2_vpp etcd_insecure_explicit_disable_https True
     fi
+
+    if [ ! -z "$JWT_CA_CERT" ] ; then
+       iniset /$Q_PLUGIN_CONF_FILE ml2_vpp jwt_signing  True
+       iniset /$Q_PLUGIN_CONF_FILE ml2_vpp jwt_controller_name_pattern $JWT_CONTROLLER_NAME_PATTERN
+       iniset /$Q_PLUGIN_CONF_FILE ml2_vpp jwt_ca_cert $JWT_CA_CERT
+       iniset /$Q_PLUGIN_CONF_FILE ml2_vpp jwt_node_cert $JWT_NODE_CERT
+       iniset /$Q_PLUGIN_CONF_FILE ml2_vpp jwt_node_private_key $JWT_NODE_PRIVATE_KEY
+       iniset /$Q_PLUGIN_CONF_FILE ml2_vpp jwt_max_duration  $JWT_MAX_DURATION
+    else
+       iniset /$Q_PLUGIN_CONF_FILE ml2_vpp jwt_signing  False
+    fi
+
 }
 
 function shut_networking_vpp_down {
